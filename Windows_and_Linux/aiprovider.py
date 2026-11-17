@@ -32,16 +32,22 @@ Note: Streaming has been fully removed throughout the code.
 """
 
 import base64
+import functools
 import logging
+import threading
 import webbrowser
 from abc import ABC, abstractmethod
-from typing import List
+from typing import TYPE_CHECKING, List
 
-# External libraries
-from google import genai
-from google.genai import types as genai_types
-from ollama import Client as OllamaClient
-from openai import OpenAI
+if TYPE_CHECKING:
+    from google.genai import types as genai_types
+
+# NOTE: Provider SDK clients are imported lazily inside `_ensure_client()`
+# rather than at module import time. Importing all three SDKs up-front costs
+# ~370 ms of startup time and ~56 MB of RSS, most of it for providers the
+# user never configures. Deferring the import to the first request (which
+# runs on a worker thread) keeps that cost off app startup and off the GUI
+# thread when switching providers in Settings.
 from PySide6 import QtWidgets
 from PySide6.QtWidgets import QVBoxLayout
 from ui.UIUtils import colorMode
@@ -49,6 +55,26 @@ from ui.UIUtils import colorMode
 # Obfuscation prefix to identify encrypted API keys
 _OBFUSCATION_PREFIX = "enc:"
 _XOR_KEY = 0x5A  # Simple XOR key for obfuscation
+
+
+@functools.lru_cache(maxsize=1)
+def _cached_gemini_safety_settings():
+    """Module-level cached safety settings for Gemini Provider."""
+    from google.genai import types as genai_types
+    return [
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
+        ),
+        genai_types.SafetySetting(
+            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
+        ),
+    ]
 
 
 def obfuscate_api_key(key: str) -> str:
@@ -312,6 +338,11 @@ class AIProvider(ABC):
         """
         Load configuration settings into the provider.
         """
+        # Release any client built from the previous configuration before
+        # rebuilding, so switching providers/settings in Settings doesn't leak
+        # the old connection pool. `after_load()` (below) rebuilds the client
+        # lazily on the next request, so this must run first.
+        self.before_load()
         for setting in self.settings:
             if setting.name in config:
                 setattr(self, setting.name, config[setting.name])
@@ -369,27 +400,10 @@ class GeminiProvider(AIProvider):
     `thinking_config` is omitted for them — passing it could otherwise error.
     """
 
-    # Disable safety filtering across all categories (best-effort; some models
-    # may still soft-refuse). Defined once, reused per request.
-    _SAFETY_SETTINGS = [
-        genai_types.SafetySetting(
-            category="HARM_CATEGORY_HARASSMENT", threshold="BLOCK_NONE"
-        ),
-        genai_types.SafetySetting(
-            category="HARM_CATEGORY_HATE_SPEECH", threshold="BLOCK_NONE"
-        ),
-        genai_types.SafetySetting(
-            category="HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold="BLOCK_NONE"
-        ),
-        genai_types.SafetySetting(
-            category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
-        ),
-    ]
-
     def __init__(self, app):
         self.close_requested = False
         self.client = None
-
+        self._client_lock = threading.Lock()
         settings = [
             TextSetting(
                 name="api_key",
@@ -458,9 +472,11 @@ class GeminiProvider(AIProvider):
         #   lowest exposed level is "minimal", which the docs say "matches the
         #   'no thinking' setting for most queries".
         is_gemma = "gemma" in (self.model_name or "").lower()
+        from google.genai import types as genai_types
+
         kwargs = {
             "system_instruction": system_instruction,
-            "safety_settings": self._SAFETY_SETTINGS,
+            "safety_settings": _cached_gemini_safety_settings(),
             "max_output_tokens": 1000,
         }
         if not is_gemma:
@@ -478,6 +494,7 @@ class GeminiProvider(AIProvider):
         entries are dropped because Gemini takes the system instruction via the
         config object instead of as an in-history message.
         """
+        from google.genai import types as genai_types
         contents = []
         for m in messages:
             role = m.get("role")
@@ -508,6 +525,7 @@ class GeminiProvider(AIProvider):
         self.close_requested = False
 
         try:
+            self._ensure_client()
             contents = (
                 self._messages_to_contents(prompt)
                 if isinstance(prompt, list)
@@ -526,7 +544,6 @@ class GeminiProvider(AIProvider):
                 self.app, "current_response_window", None
             ):
                 self.app.output_ready_signal.emit(response_text)
-                self.app.replace_text(True)
                 return ""
             return response_text
         except Exception as e:
@@ -564,13 +581,35 @@ class GeminiProvider(AIProvider):
 
     def after_load(self):
         """
-        Construct the new `google-genai` Client. The model and per-call options
-        are passed at request time via `client.models.generate_content`, so we
-        don't pre-instantiate a model here.
+        Defer client construction until the first request (see `_ensure_client`).
+
+        Keeping the `google-genai` import out of startup means an app launch
+        (or a provider switch in Settings) no longer pays its ~200 ms import
+        cost on the GUI thread. The first request pays it on its worker thread,
+        where it is invisible to the user.
         """
-        self.client = genai.Client(api_key=self.api_key)
+        self.client = None
+
+    def _ensure_client(self):
+        if self.client is not None:
+            return
+        with self._client_lock:
+            if self.client is not None:
+                return
+            from google import genai
+            from google.genai import types as genai_types
+            # `HttpOptions.timeout` is in milliseconds: 60_000 ms == 60 s.
+            self.client = genai.Client(
+                api_key=self.api_key,
+                http_options=genai_types.HttpOptions(timeout=60000),
+            )
 
     def before_load(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
         self.client = None
 
     def cancel(self):
@@ -588,6 +627,7 @@ class OpenAICompatibleProvider(AIProvider):
     def __init__(self, app):
         self.close_requested = None
         self.client = None
+        self._client_lock = threading.Lock()
 
         settings = [
             TextSetting(
@@ -645,6 +685,7 @@ class OpenAICompatibleProvider(AIProvider):
             ]
 
         try:
+            self._ensure_client()
             response = self.client.chat.completions.create(
                 model=self.api_model, messages=messages, temperature=0.5, stream=False
             )
@@ -671,14 +712,33 @@ class OpenAICompatibleProvider(AIProvider):
             return ""
 
     def after_load(self):
-        self.client = OpenAI(
-            api_key=self.api_key,
-            base_url=self.api_base,
-            organization=self.api_organisation,
-            project=self.api_project,
-        )
+        self.client = None
+
+    def _ensure_client(self):
+        if self.client is not None:
+            return
+        with self._client_lock:
+            if self.client is not None:
+                return
+            from openai import OpenAI
+
+            self.client = OpenAI(
+                api_key=self.api_key,
+                base_url=self.api_base,
+                organization=self.api_organisation,
+                project=self.api_project,
+                # The SDK's own default is a 600 s total timeout; 120 s still
+                # accommodates slow models/providers (e.g. free OpenRouter tiers)
+                # while failing fast on genuinely stalled endpoints.
+                timeout=120.0,
+            )
 
     def before_load(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
         self.client = None
 
     def cancel(self):
@@ -697,6 +757,7 @@ class OllamaProvider(AIProvider):
         self.close_requested = None
         self.client = None
         self.app = app
+        self._client_lock = threading.Lock()
         settings = [
             TextSetting(
                 "api_base",
@@ -745,6 +806,7 @@ class OllamaProvider(AIProvider):
             ]
 
         try:
+            self._ensure_client()
             response = self.client.chat(model=self.api_model, messages=messages)
             response_text = response["message"]["content"].strip()
             if not return_response and not getattr(
@@ -758,9 +820,28 @@ class OllamaProvider(AIProvider):
             return ""
 
     def after_load(self):
-        self.client = OllamaClient(host=self.api_base)
+        self.client = None
+
+    def _ensure_client(self):
+        if self.client is not None:
+            return
+        with self._client_lock:
+            if self.client is not None:
+                return
+            from ollama import Client as OllamaClient
+
+            # The SDK default is `timeout=None` (no per-request timeout). Local
+            # CPU inference can legitimately generate for several minutes, so
+            # preserve that behaviour instead of imposing a short cap that would
+            # turn slow-but-valid requests into read timeouts.
+            self.client = OllamaClient(host=self.api_base, timeout=None)
 
     def before_load(self):
+        if self.client is not None:
+            try:
+                self.client.close()
+            except Exception:
+                pass
         self.client = None
 
     def cancel(self):

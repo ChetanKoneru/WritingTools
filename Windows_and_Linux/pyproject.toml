@@ -1,7 +1,7 @@
 [project]
 name = "windows-and-linux"
 version = "0.1.0"
-description = "Add your description here"
+description = "AI writing assistant for Windows and Linux"
 readme = "README.md"
 authors = [
     { name = "hadoopchetan@gmail.com", email = "hadoopchetan@gmail.com" }
@@ -22,3 +22,6 @@ dependencies = [
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
+
+[tool.uv]
+package = false
