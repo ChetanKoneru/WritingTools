@@ -20,7 +20,9 @@ from aiprovider import (
     GeminiProvider,
     OllamaProvider,
     OpenAICompatibleProvider,
-    obfuscate_api_key,
+    _store_api_key as _store,
+    decode_legacy_api_key as _decode,
+    PROVIDER_KEYRING_IDS,
 )
 from pynput import keyboard as pykeyboard
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -260,7 +262,7 @@ class WritingToolApp(QtWidgets.QApplication):
           • SDK migration to `google-genai` is code-side only; nothing to
             do in config.
         """
-        CURRENT_CONFIG_VERSION = 9
+        CURRENT_CONFIG_VERSION = 10
         # Default for new installs and migrating users.
         NEW_DEFAULT_MODEL = "gemini-flash-latest"
         # v8 -> v9 model mapping. Every retired preset is bumped to the new
@@ -280,13 +282,15 @@ class WritingToolApp(QtWidgets.QApplication):
 
         needs_v8 = not self.config.get("is_config_file_updated_for_v8", False)
         needs_v9 = not self.config.get("is_config_file_updated_for_v9", False)
+        needs_v10 = not self.config.get("is_config_file_updated_for_v10", False)
 
-        if not needs_v8 and not needs_v9:
+        if not needs_v8 and not needs_v9 and not needs_v10:
             logging.debug("Config already up-to-date, no migration needed")
             return
 
         logging.info(
-            f"Running config migration (needs_v8={needs_v8}, needs_v9={needs_v9})..."
+            f"Running config migration (needs_v8={needs_v8}, needs_v9={needs_v9}, "
+            f"needs_v10={needs_v10})..."
         )
 
         config_changed = False
@@ -307,16 +311,27 @@ class WritingToolApp(QtWidgets.QApplication):
                     )
                     config_changed = True
 
-                # Obfuscate the API key. The helper is idempotent — already-
-                # obfuscated keys (with the `enc:` prefix) pass through
-                # unchanged.
+                # Migrate the API key into the credential store, then strip it
+                # from config.json so it never writes back to disk. Handles
+                # plaintext keys and legacy `enc:`-prefixed keys. Only pop the
+                # key from config.json when storage succeeds.
                 api_key = gemini_config.get("api_key", "")
                 if api_key:
-                    new_key = obfuscate_api_key(api_key)
-                    if new_key != api_key:
-                        gemini_config["api_key"] = new_key
-                        logging.info("[v8] Obfuscated plaintext Gemini API key")
-                        config_changed = True
+                    raw_key = _decode(api_key)
+                    if raw_key:
+                        if _store(PROVIDER_KEYRING_IDS["Gemini (Recommended)"], raw_key):
+                            logging.info("[v8] Migrated Gemini API key to credential store")
+                            config_changed = True
+                            gemini_config.pop("api_key", None)
+                        else:
+                            logging.warning(
+                                "Could not store Gemini API key; "
+                                "keeping it in config.json"
+                            )
+                    else:
+                        logging.warning(
+                            "Could not decode Gemini API key; keeping it in config.json"
+                        )
 
             # v9: only runs for users coming from v8. Preserve tier choice via
             # the V8_TO_V9_MAP so an unlimited-tier user doesn't get silently
@@ -331,10 +346,70 @@ class WritingToolApp(QtWidgets.QApplication):
                     )
                     config_changed = True
 
-        # Stamp every version flag up to current so we never re-run on
-        # subsequent startups, even if no fields actually needed changing
-        # (e.g., a v8 user who'd already picked a custom non-deprecated model).
-        for n in range(8, CURRENT_CONFIG_VERSION + 1):
+        # ── v10: move every provider's api_key from config.json into the
+        #    credential store so secrets never persist on disk. Handles
+        #    plaintext keys and legacy `enc:`-prefixed keys.
+        #    Only pop the key from config.json when storage succeeds; if the
+        #    credential store is unavailable, keep the key in config.json so
+        #    the app remains functional (and warn the user).
+        # v10_safe starts True; set False if any known provider's key could
+        # not be moved out of config.json.
+        v10_safe = True
+        if needs_v10:
+            for provider_name, provider_cfg in self.config.get(
+                "providers", {}
+            ).items():
+                if not isinstance(provider_cfg, dict):
+                    continue
+                raw_key = provider_cfg.get("api_key", None)
+                if not raw_key:
+                    continue
+                keyring_id = PROVIDER_KEYRING_IDS.get(provider_name)
+                if not keyring_id:
+                    # Provider has no keyring_id configured; leave the key
+                    # in config unchanged and log a warning (deleting a user's
+                    # secret because a dict lookup missed is never right).
+                    logging.warning(
+                        f"Provider {provider_name} has no keyring mapping; "
+                        "its api_key remains in config.json unchanged."
+                    )
+                    continue
+                api_key = _decode(raw_key)
+                if api_key:
+                    if _store(keyring_id, api_key):
+                        provider_cfg.pop("api_key", None)
+                        logging.info(
+                            f"[v10] Migrated {provider_name} API key to credential store"
+                        )
+                    else:
+                        v10_safe = False
+                        logging.warning(
+                            f"Could not store {provider_name} API key; "
+                            "keeping it in config.json"
+                        )
+                else:
+                    # Decode failed — the key stays in config.json and
+                    # never reaches the credential store.
+                    v10_safe = False
+                    logging.warning(
+                        f"Could not decode {provider_name} API key; "
+                        "keeping it in config.json"
+                    )
+
+            # One-time warning if any known provider's key stayed in config
+            if not v10_safe and not self.config.get("keyring_fallback_warning_shown"):
+                QMessageBox.warning(
+                    None,
+                    "Credential Store Unavailable",
+                    "Your API key could not be moved to the system keyring and "
+                    "remains in config.json in plaintext. Save your Settings once "
+                    "the keyring becomes available, or delete the key from "
+                    "config.json manually if you no longer need it."
+                )
+                self.config["keyring_fallback_warning_shown"] = True
+
+        stamp_range = range(8, CURRENT_CONFIG_VERSION) if not v10_safe else range(8, CURRENT_CONFIG_VERSION + 1)
+        for n in stamp_range:
             self.config[f"is_config_file_updated_for_v{n}"] = True
 
         self.save_config(self.config)

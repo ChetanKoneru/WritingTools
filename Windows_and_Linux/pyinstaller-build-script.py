@@ -127,6 +127,16 @@ def run_pyinstaller_build():
         "PySide6.Qt3DAnimation",
         "--exclude-module",
         "PySide6.Qt3DExtras",
+        "--copy-metadata",
+        "keyring",
+        "--hidden-import",
+        "keyring.backends",
+        "--hidden-import",
+        "keyring.backends.fail",
+        "--hidden-import",
+        "keyring.backends.wincred",
+        "--hidden-import",
+        "keyring.backends.secretstorage",
         "main.py",
     ]
 
