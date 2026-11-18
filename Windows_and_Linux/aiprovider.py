@@ -51,7 +51,7 @@ if TYPE_CHECKING:
 # runs on a worker thread) keeps that cost off app startup and off the GUI
 # thread when switching providers in Settings.
 from PySide6 import QtWidgets
-from PySide6.QtWidgets import QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QVBoxLayout
 from ui.UIUtils import colorMode
 
 # --- Credential store helpers (keyring / Secret Service) -------------------
@@ -288,8 +288,10 @@ class TextSetting(AIProviderSetting):
         display_name: str = None,
         default_value: str = None,
         description: str = None,
+        password: bool = False,
     ):
         super().__init__(name, display_name, default_value, description)
+        self.password = password
         self.internal_value = default_value
         self.input = None
 
@@ -301,6 +303,11 @@ class TextSetting(AIProviderSetting):
         )
         row_layout.addWidget(label)
         self.input = QtWidgets.QLineEdit(self.internal_value)
+        if self.password:
+            # Mask the value by default (API keys shouldn't be shown in
+            # plaintext on screen). Users can toggle visibility with the
+            # "Show key" checkbox.
+            self.input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.input.setStyleSheet(f"""
             font-size: 16px;
             padding: 5px;
@@ -310,6 +317,19 @@ class TextSetting(AIProviderSetting):
         """)
         self.input.setPlaceholderText(self.description)
         row_layout.addWidget(self.input)
+        if self.password:
+            show_key = QCheckBox("Show key")
+            show_key.setStyleSheet(
+                f"font-size: 16px; color: {'#ffffff' if colorMode == 'dark' else '#333333'};"
+            )
+            show_key.toggled.connect(
+                lambda checked: self.input.setEchoMode(
+                    QtWidgets.QLineEdit.EchoMode.Normal
+                    if checked
+                    else QtWidgets.QLineEdit.EchoMode.Password
+                )
+            )
+            row_layout.addWidget(show_key)
         layout.addLayout(row_layout)
 
     def set_value(self, value):
@@ -648,20 +668,20 @@ class AIProvider(ABC):
         Also blanks the rendered `api_key` widget so a subsequent Save in
         SettingsWindow doesn't re-enter the key from the stale field text,
         and invalidates the cached client so this session can't reuse it.
+
+        Returns False when the credential store is unavailable; the key is
+        still removed from config.json regardless.
         """
         snapshot = None
+        keyring_failure = False
         if self._keyring_id:
             try:
                 snapshot = _read_credential_snapshot(self._keyring_id)
             except CredentialStoreError:
-                return False
+                keyring_failure = True
             if not _delete_api_key(self._keyring_id):
-                # A delete backend can remove a credential then raise or fail
-                # verification. Restore the known old state before reporting
-                # an ordinary failure.
-                if not _restore_credential_snapshot(self._keyring_id, snapshot):
-                    raise CredentialStoreUncertainError()
-                return False
+                keyring_failure = True
+
         target_config = copy.deepcopy(self.app.config)
         providers_cfg = target_config.get("providers", {})
         entry = providers_cfg.get(self.provider_name, {})
@@ -670,12 +690,12 @@ class AIProvider(ABC):
             try:
                 self.app.save_config(target_config)
             except OSError:
-                if self._keyring_id and not _restore_credential_snapshot(
-                    self._keyring_id, snapshot
-                ):
-                    raise CredentialStoreUncertainError()
+                if snapshot is not None and self._keyring_id:
+                    if not _restore_credential_snapshot(self._keyring_id, snapshot):
+                        raise CredentialStoreUncertainError()
                 return False
             self.app.config = target_config
+
         # Blank every rendered widget too, not just the in-memory attribute,
         # so a Save in SettingsWindow doesn't re-enter the key from the
         # stale field text.
@@ -688,7 +708,7 @@ class AIProvider(ABC):
         self.api_key = ""
         # Invalidate any cached client so this session can't reuse it.
         self.before_load()
-        return True
+        return not keyring_failure
 
 
 class GeminiProvider(AIProvider):
@@ -717,6 +737,7 @@ class GeminiProvider(AIProvider):
                 name="api_key",
                 display_name="API Key",
                 description="Paste your Gemini API key here",
+                password=True,
             ),
             DropdownSetting(
                 name="model_name",
@@ -912,6 +933,7 @@ class OpenAICompatibleProvider(AIProvider):
                 name="api_key",
                 display_name="API Key",
                 description="API key for the OpenAI-compatible API.",
+                password=True,
             ),
             TextSetting(
                 "api_base",
