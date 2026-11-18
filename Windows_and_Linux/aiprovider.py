@@ -514,6 +514,10 @@ class AIProvider(ABC):
         """
         Remove the stored API key from the credential store and config fallback.
         This is the only supported path for revoking a key.
+
+        Also blanks the rendered `api_key` widget so a subsequent Save in
+        SettingsWindow doesn't re-enter the key from the stale field text,
+        and invalidates the cached client so this session can't reuse it.
         """
         if self._keyring_id:
             _delete_api_key(self._keyring_id)
@@ -522,7 +526,18 @@ class AIProvider(ABC):
         if "api_key" in entry:
             entry.pop("api_key", None)
             self.app.save_config(self.app.config)
+        # Blank every rendered widget too, not just the in-memory attribute,
+        # so a Save in SettingsWindow doesn't re-enter the key from the
+        # stale field text.
+        for setting in self.settings:
+            if setting.name == "api_key":
+                setting.set_value("")
+                widget = getattr(setting, "input", None)
+                if widget is not None:
+                    widget.clear()
         self.api_key = ""
+        # Invalidate any cached client so this session can't reuse it.
+        self.before_load()
 
 
 class GeminiProvider(AIProvider):

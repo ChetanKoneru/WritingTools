@@ -224,6 +224,26 @@ class TestClearStoredApiKey(unittest.TestCase):
         provider.api_key = "STORE-KEY"
         return provider, app
 
+    def _provider_with_rendered_ui(self, ui_value, existing_config=None):
+        """Full render path: widgets are real QLineEdits, Save goes through
+        ``save_config()`` and reads them back with ``get_value()``."""
+        config = {
+            "providers": {
+                "Gemini (Recommended)": existing_config
+                if existing_config is not None
+                else {}
+            }
+        }
+        app = FakeApp(config)
+        provider = GeminiProvider(app)
+        for setting in provider.settings:
+            if setting.name == "api_key":
+                setting.set_value(ui_value)
+            elif setting.name == "model_name":
+                setting.set_value("gemini-flash-latest")
+            setting.render_to_layout(QtWidgets.QVBoxLayout())
+        return provider, app
+
     def test_clear_removes_keyring_entry_and_config_fallback(self):
         config = {
             "providers": {
@@ -261,7 +281,9 @@ class TestClearStoredApiKey(unittest.TestCase):
         self.assertEqual(provider.api_key, "")
 
     def test_clear_without_config_key_is_noop(self):
-        config = {"providers": {"Gemini (Recommended)": {"model_name": "gemini-flash-latest"}}}
+        config = {
+            "providers": {"Gemini (Recommended)": {"model_name": "gemini-flash-latest"}}
+        }
         provider, app = self._provider_with_config(config)
         with mock.patch.object(aiprovider, "_delete_api_key", return_value=True) as m:
             provider.clear_stored_api_key()
@@ -271,6 +293,27 @@ class TestClearStoredApiKey(unittest.TestCase):
             app.config["providers"]["Gemini (Recommended)"]["model_name"],
             "gemini-flash-latest",
         )
+
+    def test_clear_then_save_preserves_nothing(self):
+        """Clear → Save regression: after revocation, Save must not restore the key."""
+        config = {
+            "providers": {
+                "Gemini (Recommended)": {
+                    "api_key": "CONFIG-KEY",
+                    "model_name": "gemini-flash-latest",
+                }
+            }
+        }
+        # Render the full UI so Save reads the widget text, not the in-memory value
+        provider, app = self._provider_with_rendered_ui("CONFIG-KEY", config)
+        # Clear the key from both store and rendered widget
+        provider.clear_stored_api_key()
+        # Verify the store is empty
+        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+        # Now Save – this is the regression test
+        provider.save_config()
+        # The store must remain empty; no key should be written back
+        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
 
 
 class TestKeyringIdSingleSourceOfTruth(unittest.TestCase):

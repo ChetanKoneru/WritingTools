@@ -180,17 +180,44 @@ class SettingsWindow(QtWidgets.QWidget):
                 and getattr(provider, "_keyring_id", None)
             ):
                 clear_btn = QPushButton("Clear stored API key")
+                # Readable contrast: dark background with white text in
+                # both themes (the previous "light grey bg + white text"
+                # pairing was unreadable in both light and dark).
                 clear_btn.setStyleSheet(f"""
                     QPushButton {{
-                        background-color: {"#f5f5f5" if colorMode == "dark" else "#e0e0e0"};
+                        background-color: {"#b3261e" if colorMode == "dark" else "#c62828"};
                         color: white;
                         padding: 4px 8px;
                         font-size: 14px;
                         border: none;
                         border-radius: 3px;
                     }}
+                    QPushButton:hover {{
+                        background-color: {"#d32f2f" if colorMode == "dark" else "#b71c1c"};
+                    }}
                 """)
-                clear_btn.clicked.connect(provider.clear_stored_api_key)
+
+                def _confirm_and_clear():
+                    # One-click destructive action; ask first, matching
+                    # the rest of the app's flows.
+                    reply = QtWidgets.QMessageBox.question(
+                        self,
+                        _("Clear API key"),
+                        _(
+                            "Remove the stored API key for %s?\n\n"
+                            "This cannot be undone. You will need to re-enter "
+                            "the key from your provider's website."
+                        )
+                        % provider.provider_name,
+                        QtWidgets.QMessageBox.StandardButton.Yes
+                        | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                        return
+                    provider.clear_stored_api_key()
+
+                clear_btn.clicked.connect(_confirm_and_clear)
                 self.current_provider_layout.addWidget(clear_btn)
 
         layout.addLayout(self.current_provider_layout)
