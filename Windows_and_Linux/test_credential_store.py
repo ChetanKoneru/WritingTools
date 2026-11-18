@@ -36,6 +36,54 @@ from aiprovider import (
 _qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
+# --- Global fake keyring ----------------------------------------------------
+# Module-level fake so NO test can reach the developer's real credential
+# store, even if a test forgets to patch an individual helper. Individual
+# tests may set `_fake_keyring._fail = True` to simulate an unavailable
+# backend.
+_fake_keyring = types.ModuleType("keyring")
+_fake_keyring._store = {}
+_fake_keyring._fail = False
+
+
+def _fake_set_password(service, account, password):
+    if _fake_keyring._fail:
+        raise RuntimeError("no backend")
+    _fake_keyring._store[account] = password
+
+
+def _fake_get_password(service, account):
+    if _fake_keyring._fail:
+        raise RuntimeError("no backend")
+    return _fake_keyring._store.get(account)
+
+
+def _fake_delete_password(service, account):
+    if _fake_keyring._fail:
+        raise RuntimeError("no backend")
+    if account not in _fake_keyring._store:
+        err = type("PasswordDeleteError", (Exception,), {})
+        raise err("not found")
+    del _fake_keyring._store[account]
+
+
+_fake_keyring.set_password = _fake_set_password
+_fake_keyring.get_password = _fake_get_password
+_fake_keyring.delete_password = _fake_delete_password
+
+
+def setUpModule():
+    """Install a fake keyring module for the entire test suite."""
+    _fake_keyring._store.clear()
+    _fake_keyring._fail = False
+    sys.modules["keyring"] = _fake_keyring
+
+
+def tearDownModule():
+    sys.modules.pop("keyring", None)
+
+
+
 def make_enc_key(plaintext: str) -> str:
     """Encode a key the way v8/v9 did (XOR 0x5A + base64) for round-trip tests."""
     import base64
@@ -73,39 +121,14 @@ class TestDecodeLegacyApiKey(unittest.TestCase):
 
 class TestCredentialStoreHelpers(unittest.TestCase):
     def setUp(self):
-        self._orig_keyring = sys.modules.get("keyring")
-        self.fake = types.ModuleType("keyring")
-        self.fake._store = {}
+        # The module-level setUpModule() already installed a fake keyring,
+        # but per-test isolation is still useful for toggling _fail.
+        self.fake = _fake_keyring
+        self.fake._store.clear()
         self.fake._fail = False
 
-        def set_password(service, account, password):
-            if self.fake._fail:
-                raise RuntimeError("no backend")
-            self.fake._store[account] = password
-
-        def get_password(service, account):
-            if self.fake._fail:
-                raise RuntimeError("no backend")
-            return self.fake._store.get(account)
-
-        def delete_password(service, account):
-            if self.fake._fail:
-                raise RuntimeError("no backend")
-            if account not in self.fake._store:
-                err = type("PasswordDeleteError", (Exception,), {})
-                raise err("not found")
-            del self.fake._store[account]
-
-        self.fake.set_password = set_password
-        self.fake.get_password = get_password
-        self.fake.delete_password = delete_password
-        sys.modules["keyring"] = self.fake
-
     def tearDown(self):
-        if self._orig_keyring is not None:
-            sys.modules["keyring"] = self._orig_keyring
-        else:
-            sys.modules.pop("keyring", None)
+        self.fake._fail = False
 
     def test_store_and_retrieve(self):
         self.assertTrue(_store_api_key("p1", "secret"))
@@ -306,14 +329,20 @@ class TestClearStoredApiKey(unittest.TestCase):
         }
         # Render the full UI so Save reads the widget text, not the in-memory value
         provider, app = self._provider_with_rendered_ui("CONFIG-KEY", config)
-        # Clear the key from both store and rendered widget
-        provider.clear_stored_api_key()
-        # Verify the store is empty
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
-        # Now Save – this is the regression test
-        provider.save_config()
-        # The store must remain empty; no key should be written back
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+        # Patch both helpers so no test can reach the real credential store.
+        # Clear should succeed; Save should also succeed so we can assert
+        # the key isn't re-stored from the stale widget text.
+        with (
+            mock.patch.object(aiprovider, "_delete_api_key", return_value=True),
+            mock.patch.object(aiprovider, "_store_api_key", return_value=True),
+        ):
+            provider.clear_stored_api_key()
+            # Verify the store is empty
+            self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+            # Now Save – this is the regression test
+            provider.save_config()
+            # The store must remain empty; no key should be written back
+            self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
 
 
 class TestKeyringIdSingleSourceOfTruth(unittest.TestCase):
