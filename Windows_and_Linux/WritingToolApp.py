@@ -2,10 +2,12 @@ import gettext
 import json
 import logging
 import os
+import secrets
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -36,16 +38,20 @@ _ = gettext.gettext
 
 class _SelectedTextHolder:
     """
-    Carries the result of an async clipboard capture from `_show_popup` to
-    `process_option_thread`. The capture thread sets `text` and signals
-    `ready` once done.
+    Carries a worker capture result to the GUI finalizer. The GUI thread sets
+    `ready` after any PRIMARY confirmation, then opens the popup or dispatches
+    a direct option.
     """
 
-    __slots__ = ("text", "ready")
+    __slots__ = ("text", "ready", "error", "show_popup", "direct_option", "source_window_id")
 
     def __init__(self):
         self.text = ""
         self.ready = threading.Event()
+        self.error = ""
+        self.show_popup = False
+        self.direct_option = None
+        self.source_window_id = None
 
 
 class WritingToolApp(QtWidgets.QApplication):
@@ -57,6 +63,7 @@ class WritingToolApp(QtWidgets.QApplication):
     show_message_signal = Signal(str, str)  # a signal for showing message boxes
     hotkey_triggered_signal = Signal()
     followup_response_signal = Signal(str)
+    capture_finished_signal = Signal(object, str)
 
     def __init__(self, argv):
         super().__init__(argv)
@@ -65,6 +72,7 @@ class WritingToolApp(QtWidgets.QApplication):
         self.output_ready_signal.connect(self.replace_text)
         self.show_message_signal.connect(self.show_message_box)
         self.hotkey_triggered_signal.connect(self.on_hotkey_pressed)
+        self.capture_finished_signal.connect(self._on_capture_finished)
         self.config = None
         self.config_path = None
         self.load_config()
@@ -98,17 +106,6 @@ class WritingToolApp(QtWidgets.QApplication):
         # Window that was active when the hotkey fired. Used to re-activate
         # it before pasting an AI replacement (Wayland focus handling).
         self._source_window_id = None
-
-        # PRIMARY (the Linux mouse selection) is sticky: KDE keeps the last
-        # highlighted text around long after the highlight is gone, and it
-        # survives restarts of this app. Remember what was selected at startup
-        # (and after every capture) so leftover text (e.g. log lines selected
-        # for a chat message) is never mistaken for a selection made for the
-        # current hotkey press. Freshness is decided by comparing the live
-        # selection against this remembered value at capture time, so no
-        # background polling thread is needed.
-        self._primary_selection_last_seen = self._read_primary_selection()
-        self._last_captured_selection = None
 
         self._ = gettext.gettext
 
@@ -446,10 +443,65 @@ class WritingToolApp(QtWidgets.QApplication):
         """
         Save the configuration file.
         """
-        with open(self.config_path, "w") as f:
-            json.dump(config, f, indent=4)
-            logging.debug("Config saved successfully")
-        self.config = config
+        config_dir = os.path.dirname(os.path.abspath(self.config_path))
+        temp_path = None
+        directory_fd = None
+        replaced = False
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="w",
+                encoding="utf-8",
+                dir=config_dir,
+                prefix=f".{os.path.basename(self.config_path)}.",
+                suffix=".tmp",
+                delete=False,
+            ) as f:
+                temp_path = f.name
+                json.dump(config, f, indent=4)
+                f.flush()
+                os.fsync(f.fileno())
+
+            # Keep the directory open across replace so its metadata can be
+            # synced too.  That makes the rename durable on POSIX filesystems.
+            # Windows does not support opening directories this way.
+            if sys.platform != "win32":
+                directory_fd = os.open(
+                    config_dir, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+                )
+            os.replace(temp_path, self.config_path)
+            temp_path = None
+            replaced = True
+            self.config = config
+
+            if directory_fd is not None:
+                try:
+                    os.fsync(directory_fd)
+                except OSError:
+                    # The new file is already visible.  Do not report this as
+                    # a failed save, or callers could roll back credentials
+                    # that have in fact been committed to the config file.
+                    logging.warning(
+                        "Config replacement committed; directory durability is unconfirmed."
+                    )
+        finally:
+            if directory_fd is not None:
+                try:
+                    os.close(directory_fd)
+                except OSError:
+                    if replaced:
+                        # As above, closing after replacement must not turn a
+                        # committed config change into an apparent failure.
+                        logging.warning(
+                            "Config replacement committed; directory durability is unconfirmed."
+                        )
+            # Close the directory before cleanup: even an unexpected unlink
+            # error must not leak the descriptor opened for the replacement.
+            if temp_path is not None:
+                try:
+                    os.unlink(temp_path)
+                except FileNotFoundError:
+                    pass
+        logging.debug("Config saved successfully")
 
     def show_onboarding(self):
         """
@@ -589,6 +641,10 @@ class WritingToolApp(QtWidgets.QApplication):
         """
         logging.debug(f'Firing button "{button_name}" directly')
 
+        if self._capture_lock.locked():
+            logging.debug("Ignoring direct hotkey while a capture owns source focus")
+            return
+
         # If the popup is currently visible (e.g., user opened it then
         # pressed a button hotkey), close it so it doesn't compete.
         if self.popup_window is not None and self.popup_window.isVisible():
@@ -600,18 +656,9 @@ class WritingToolApp(QtWidgets.QApplication):
         if not self.options or button_name not in self.options:
             logging.warning(f'Button "{button_name}" no longer exists; ignoring hotkey')
             return
-
         self.current_text_holder = _SelectedTextHolder()
+        self.current_text_holder.direct_option = button_name
         self._fire_ctrl_c_and_capture_async(self.current_text_holder)
-
-        # Keep the source window in sync for inline replacements via direct
-        # hotkey (mirrors the main hotkey path in `on_hotkey_pressed`).
-        self._capture_source_window()
-
-        # Same worker path as a popup-button click. process_option_thread
-        # waits on the holder, surfaces "Please select text…" if empty,
-        # and routes window-mode options through the response window.
-        self.process_option(button_name)
 
     def register_hotkey(self):
         """
@@ -623,7 +670,7 @@ class WritingToolApp(QtWidgets.QApplication):
 
     def _capture_source_window(self):
         """
-        Remember the window that currently has focus, so an inline
+        Return the window that currently has focus, so an inline
         replacement can return focus to it before pasting an AI
         replacement. Only meaningful on Linux/KDE, where kdotool can
         both read the active window and re-activate it. kdotool identifies
@@ -631,7 +678,7 @@ class WritingToolApp(QtWidgets.QApplication):
         decimal id, so the value is used verbatim.
         """
         if not (sys.platform.startswith("linux") and shutil.which("kdotool")):
-            return
+            return None
         try:
             result = subprocess.run(
                 ["kdotool", "getactivewindow"],
@@ -641,11 +688,12 @@ class WritingToolApp(QtWidgets.QApplication):
             )
         except Exception as e:
             logging.debug(f"Could not capture source window: {e}")
-            return
+            return None
         window_id = (result.stdout or "").strip()
         if result.returncode == 0 and window_id:
-            self._source_window_id = window_id
             logging.debug(f"Captured source window: {window_id}")
+            return window_id
+        return None
 
     def on_hotkey_pressed(self):
         """
@@ -658,10 +706,6 @@ class WritingToolApp(QtWidgets.QApplication):
             logging.warning("Hotkey spam detected - quitting application")
             self.exit_app()
             return
-
-        # Capture the active window ID on Wayland/Linux so we can return
-        # focus there for the paste after the user selects an option.
-        self._capture_source_window()
 
         # Original hotkey handling continues...
         if self.current_provider:
@@ -677,22 +721,68 @@ class WritingToolApp(QtWidgets.QApplication):
     @Slot()
     def _show_popup(self):
         """
-        Show the popup window the moment the hotkey fires, and capture the
-        user's selected text in parallel — popup display no longer waits on
-        the clipboard. The old behaviour gated popup show on a 0.2-0.5s
-        clipboard read, which on slower systems would time out and
-        incorrectly fall back to the chat-only "Ask your AI" UI even when
-        text *was* selected. We now assume text is always selected;
-        `process_option_thread` waits on the holder before kicking off the
-        AI request.
+        Capture the user's selected text, then show the popup. Keeping the
+        source focused until capture completes ensures native copy reaches
+        the source application rather than our custom input.
         """
-        logging.debug("Showing popup window")
+        logging.debug("Preparing selected-text capture before showing popup")
 
-        # Fresh holder per popup. Fire Ctrl+C *before* we create the popup
-        # so the keystroke is queued while focus is still on the user's
-        # source app — the actual clipboard read happens in the background.
+        if self._capture_lock.locked():
+            logging.debug("Ignoring hotkey while a capture owns source focus")
+            return
+
+        if self.popup_window is not None:
+            self.popup_window.close()
+            self.popup_window.deleteLater()
+            self.popup_window = None
+
+        # The worker owns every blocking clipboard/injector operation. Do not
+        # focus a popup until its completion is queued back to this thread.
         self.current_text_holder = _SelectedTextHolder()
+        self.current_text_holder.show_popup = True
         self._fire_ctrl_c_and_capture_async(self.current_text_holder)
+
+    @Slot(object, str)
+    def _on_capture_finished(self, holder, primary_text):
+        """Finalize a worker capture on the GUI thread."""
+        if holder is not self.current_text_holder:
+            return
+        selection_declined = False
+        if primary_text:
+            box = QMessageBox(self.activeWindow())
+            box.setIcon(QMessageBox.Icon.Question)
+            box.setWindowTitle("Use saved selection?")
+            box.setTextFormat(QtCore.Qt.TextFormat.PlainText)
+            box.setText(
+                "Copy did not produce text. Your desktop may retain selected text "
+                "after it is deselected. Use the text shown below?"
+            )
+            box.setDetailedText(primary_text)
+            box.setInformativeText(primary_text[:500])
+            use_button = box.addButton("Use this text", QMessageBox.ButtonRole.AcceptRole)
+            box.addButton(QMessageBox.StandardButton.Cancel)
+            box.setDefaultButton(QMessageBox.StandardButton.Cancel)
+            box.exec()
+            if holder is not self.current_text_holder:
+                return
+            if box.clickedButton() is use_button:
+                holder.text = primary_text
+                holder.error = ""
+            else:
+                holder.error = "No text selected."
+                selection_declined = True
+        self._source_window_id = holder.source_window_id
+        holder.ready.set()
+        if selection_declined:
+            return
+        if holder.direct_option is not None:
+            self.process_option(holder.direct_option)
+        elif holder.show_popup:
+            self._open_popup()
+
+    def _open_popup(self):
+        """Create the popup on the GUI thread after capture setup is safe."""
+        logging.debug("Showing popup window")
 
         try:
             if self.popup_window is not None:
@@ -745,68 +835,6 @@ class WritingToolApp(QtWidgets.QApplication):
             logging.debug(f"Popup window moved to position: ({x}, {y})")
         except Exception as e:
             logging.error(f"Error showing popup window: {e}", exc_info=True)
-
-    @staticmethod
-    def _read_primary_selection():
-        """
-        Return the current PRIMARY (mouse) selection on Linux, or '' if the
-        platform doesn't have one / nothing is selected.
-
-        This is the most reliable way to obtain "the text the user just
-        selected": no keystroke injection and no clipboard round-trip.
-
-        It matters most on Wayland, where `pynput`'s synthetic Ctrl+C only
-        reaches XWayland clients — native Wayland apps never copy anything.
-        The old fallback then read whatever was already in the clipboard
-        (e.g. text copied minutes earlier) and happily sent that to the AI.
-        """
-        if not sys.platform.startswith("linux"):
-            return ""
-
-        commands = []
-        # On a Wayland session `wl-paste` sees PRIMARY for both native clients
-        # and XWayland apps (XWayland bridges the two), so there is no need to
-        # also try xclip — and skipping it halves the number of processes the
-        # change watcher spawns per poll.
-        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
-            commands.append(["wl-paste", "-n", "-t", "text", "-p"])
-        elif os.environ.get("DISPLAY") and shutil.which("xclip"):
-            commands.append(["xclip", "-selection", "primary", "-o"])
-
-        for command in commands:
-            try:
-                result = subprocess.run(
-                    command, capture_output=True, text=True, timeout=1.0
-                )
-            except Exception as e:
-                logging.debug(f"Primary selection read failed via {command[0]}: {e}")
-                continue
-            if result.returncode == 0 and result.stdout:
-                return result.stdout
-        return ""
-
-    def _primary_selection_is_fresh(self, text):
-        """
-        Decide whether `text`, just read from PRIMARY, may be treated as the
-        user's selection for the current hotkey press.
-
-        Accepted when:
-        - it is the selection captured last time (the user is re-running an
-          option on the same text without re-selecting it), or
-        - it differs from the selection seen at the last capture (or at
-          startup) — i.e. the user highlighted something new.
-
-        Rejected otherwise, forcing the clipboard path so leftover text
-        (e.g. logs selected before the app launched) is never mistaken for
-        the current selection. This is a direct comparison against the last
-        value we acted on, so it does not depend on any sampling phase: a
-        selection made a moment before the hotkey press is still accepted.
-        """
-        if not text.strip():
-            return False
-        if text == self._last_captured_selection:
-            return True
-        return text != self._primary_selection_last_seen
 
     @staticmethod
     def _press_ctrl(key):
@@ -1072,127 +1100,114 @@ class WritingToolApp(QtWidgets.QApplication):
 
     def _fire_ctrl_c_and_capture_async(self, holder):
         """
-        Capture the user's selected text.
+        Capture selected text through an explicit copy operation.
 
-        On Linux the PRIMARY selection is read directly (see
-        `_read_primary_selection`), which works on X11 and Wayland alike and
-        leaves the clipboard untouched. Only a *fresh* primary selection is
-        used (see `_primary_selection_is_fresh`); leftover text from before
-        the hotkey press falls through to the clipboard path.
-
-        If there is no fresh primary selection (Windows, a stale selection,
-        or an app that doesn't publish one), inject the copy shortcut and
-        poll the clipboard.
-
-        The PRIMARY read is a single quick subprocess. The clipboard fallback
-        injects the copy shortcut synchronously (it must land while focus is
-        still on the source app, before the popup opens) and then returns;
-        the actual clipboard polling happens on a background thread.
+        A random clipboard marker establishes a per-capture baseline, so a
+        successful copy is accepted even when its text equals the old
+        clipboard. The complete clipboard transaction is serialized until
+        restore, while polling remains off the GUI thread. On Linux Ctrl+Insert
+        avoids sending Ctrl+C to a terminal (where it means SIGINT).
         """
-        primary_text = self._read_primary_selection()
-        if self._primary_selection_is_fresh(primary_text):
-            self._last_captured_selection = primary_text
-            self._primary_selection_last_seen = primary_text
-            holder.text = primary_text
-            logging.debug(
-                f"Captured primary selection (len={len(primary_text)}): "
-                f"{primary_text[:80].replace(chr(10), ' ')!r}"
-            )
-            holder.ready.set()
+        if not self._capture_lock.acquire(blocking=False):
+            holder.error = "A text capture is already in progress. Please try again."
+            WritingToolApp._finish_capture(self, holder)
             return
-        if primary_text.strip():
-            logging.warning(
-                "Ignoring stale primary selection (unchanged since startup or "
-                f"last capture, len={len(primary_text)}): "
-                f"{primary_text[:80].replace(chr(10), ' ')!r}"
-            )
 
-        clipboard_backup = self._read_clipboard()
-
-        self.clear_clipboard()
-
-        # Ctrl+Insert is the traditional Unix "copy" shortcut. Prefer it over
-        # Ctrl+C because Ctrl+C is SIGINT in terminals, and an injected Ctrl+C
-        # into the terminal the user is selecting from would interrupt
-        # whatever is running there.
-        linux = sys.platform.startswith("linux")
-        if linux:
-            # Same policy as the paste path: pynput cannot reach native
-            # Wayland clients, so don't report success for an event that goes
-            # nowhere.
-            injected = self._inject_ctrl(
-                pykeyboard.Key.insert.value,
-                "insert",
-                110,
-                allow_pynput=not os.environ.get("WAYLAND_DISPLAY"),
-            )
-            if not injected:
-                logging.warning(
-                    "No injector available to copy the selection "
-                    "(install ydotool or dotool)"
-                )
-        else:
-            injected = self._press_ctrl("c")
-            if injected:
-                logging.debug("Injected Ctrl+C to copy selection")
-
-        if injected and linux and os.environ.get("WAYLAND_DISPLAY"):
-            # The popup is created as soon as this returns and would take
-            # keyboard focus. Give the compositor time to deliver the copy
-            # to the source window first.
-            time.sleep(0.1)
-
-        def _poll_clipboard():
-            # Lock so concurrent hotkey presses don't trample each other's
-            # in-flight captures.
-            with self._capture_lock:
-                text = ""
-                try:
-                    deadline = time.time() + 2.0
-                    cleared = False
-                    while time.time() < deadline:
-                        current = self._read_clipboard(1.0)
-                        if current:
-                            # Never accept pre-existing clipboard content.
-                            # If the clear wasn't observed (clipboard managers
-                            # can restore the previous entry) require the
-                            # value to have actually changed; otherwise Ctrl+C
-                            # failed and the old clipboard would masquerade as
-                            # the user's selection.
-                            if cleared or current != clipboard_backup:
-                                text = current
-                                break
-                        else:
-                            cleared = True
-                        time.sleep(0.05)
-                    holder.text = text
-                    if text:
-                        logging.debug(
-                            f"Captured selected text (len={len(text)}): "
-                            f"{text[:80].replace(chr(10), ' ')!r}"
-                        )
-                    else:
-                        logging.warning(
-                            "No new selected text detected (clipboard did not change)"
-                        )
-                finally:
-                    try:
-                        pyperclip.copy(clipboard_backup)
-                    except Exception as e:
-                        logging.error(f"Error restoring clipboard: {e}")
-                    holder.ready.set()
-
-        threading.Thread(target=_poll_clipboard, daemon=True).start()
+        try:
+            threading.Thread(
+                target=WritingToolApp._capture_selected_text_worker,
+                args=(self, holder),
+                daemon=True,
+            ).start()
+        except Exception as e:
+            holder.error = "Could not start clipboard capture. Please try again."
+            logging.error("Could not start clipboard capture worker: %s", e)
+            self._capture_lock.release()
+            WritingToolApp._finish_capture(self, holder)
 
     @staticmethod
-    def clear_clipboard():
-        """
-        Clear the system clipboard.
-        """
+    def _read_primary_selection():
+        """Read PRIMARY only as an explicitly-confirmed recovery candidate."""
+        if not sys.platform.startswith("linux"):
+            return ""
+        command = None
+        if os.environ.get("WAYLAND_DISPLAY") and shutil.which("wl-paste"):
+            command = ["wl-paste", "-n", "-t", "text", "-p"]
+        elif os.environ.get("DISPLAY") and shutil.which("xclip"):
+            command = ["xclip", "-selection", "primary", "-o"]
+        if not command:
+            return ""
         try:
-            pyperclip.copy("")
+            result = subprocess.run(command, capture_output=True, text=True, timeout=1)
+            return result.stdout if result.returncode == 0 else ""
         except Exception as e:
-            logging.error(f"Error clearing clipboard: {e}")
+            logging.debug("Could not read PRIMARY selection: %s", e)
+            return ""
+
+    def _finish_capture(self, holder, primary_text=""):
+        """Queue GUI-only capture finalization; safe to call from a worker."""
+        self.capture_finished_signal.emit(holder, primary_text)
+
+    def _capture_selected_text_worker(self, holder):
+        """Worker-only clipboard transaction. It never touches Qt widgets."""
+        clipboard_backup = ""
+        marker = f"WritingTools capture {secrets.token_urlsafe(24)}"
+        text = ""
+        injected = False
+        copy_attempted = False
+        try:
+            holder.source_window_id = WritingToolApp._capture_source_window(self)
+            clipboard_backup = self._read_clipboard()
+            pyperclip.copy(marker)
+            deadline = time.monotonic() + 0.5
+            observed = self._read_clipboard(0.1)
+            while observed != marker and time.monotonic() < deadline:
+                time.sleep(0.02)
+                observed = self._read_clipboard(0.1)
+            if observed != marker:
+                raise RuntimeError("clipboard marker could not be verified")
+
+            if sys.platform.startswith("linux"):
+                copy_attempted = True
+                injected = self._inject_ctrl(
+                    pykeyboard.Key.insert.value, "insert", 110,
+                    allow_pynput=not os.environ.get("WAYLAND_DISPLAY"),
+                )
+            else:
+                copy_attempted = True
+                injected = self._press_ctrl("c")
+            if not injected:
+                holder.error = "Could not send the copy shortcut. Select text and try again."
+                return
+
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                current = self._read_clipboard(1.0)
+                if current and current != marker:
+                    text = current
+                    holder.text = text
+                    break
+                time.sleep(0.05)
+            if not text:
+                holder.error = "No new selected text detected. Select text and try again."
+        except Exception as e:
+            logging.warning("Selected-text capture failed: %s", e)
+            holder.error = "Could not access the clipboard. Check your clipboard tools and try again."
+        finally:
+            try:
+                # Empty clipboard is never evidence of our ownership.
+                current = self._read_clipboard()
+                if current == marker or (text and current == text):
+                    pyperclip.copy(clipboard_backup)
+            except Exception:
+                logging.exception("Could not restore clipboard after capture")
+            self._capture_lock.release()
+            primary_text = (
+                WritingToolApp._read_primary_selection()
+                if copy_attempted and not text
+                else ""
+            )
+            WritingToolApp._finish_capture(self, holder, primary_text)
 
     def process_option(self, option, custom_change=None):
         """
@@ -1219,8 +1234,11 @@ class WritingToolApp(QtWidgets.QApplication):
             old_window.close()
             old_window.deleteLater()
 
+        holder = self.current_text_holder
         threading.Thread(
-            target=self.process_option_thread, args=(option, custom_change), daemon=True
+            target=self.process_option_thread,
+            args=(option, custom_change, holder),
+            daemon=True,
         ).start()
 
     @Slot(str, str)
@@ -1239,7 +1257,7 @@ class WritingToolApp(QtWidgets.QApplication):
             }
         ]
 
-    def process_option_thread(self, option, custom_change=None):
+    def process_option_thread(self, option, custom_change=None, holder=None):
         """
         Worker: wait for the background clipboard capture to land, then
         either open a response window (for window-mode options) or set up
@@ -1251,7 +1269,6 @@ class WritingToolApp(QtWidgets.QApplication):
         # and click. The 3s ceiling is a safety net for genuinely sluggish
         # systems; if the 2s polling deadline in the capture thread tripped
         # first, the event is already set and this returns immediately.
-        holder = self.current_text_holder
         if holder is None or not holder.ready.wait(timeout=3.0):
             logging.warning("Timed out waiting for selected text capture")
         selected_text = (holder.text if holder else "") or ""
@@ -1263,7 +1280,9 @@ class WritingToolApp(QtWidgets.QApplication):
             # interpretation and surface the error.
             self.show_message_signal.emit(
                 "Error",
-                "No text selected.\n\n"
+                holder.error
+                if holder and holder.error
+                else "No text selected.\n\n"
                 "Select the text you want to use, then press the hotkey again.",
             )
             return
