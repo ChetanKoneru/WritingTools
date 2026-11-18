@@ -4,12 +4,18 @@ import sys
 from aiprovider import AIProvider
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QImage
-from PySide6.QtWidgets import QHBoxLayout, QRadioButton, QScrollArea
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QPushButton,
+    QRadioButton,
+    QScrollArea,
+)
 
 from ui.AutostartManager import AutostartManager
 from ui.UIUtils import UIUtils, colorMode
 
-_ = lambda x: x
+def _(x):
+    return x
 
 
 class SettingsWindow(QtWidgets.QWidget):
@@ -152,12 +158,67 @@ class SettingsWindow(QtWidgets.QWidget):
 
         # Add provider settings
         for setting in provider.settings:
-            setting.set_value(
-                self.app.config["providers"][provider.provider_name].get(
-                    setting.name, setting.default_value
+            # api_key lives in the credential store, not in config.json —
+            # populate the field from the provider's stored key instead.
+            if (
+                setting.name == "api_key"
+                and getattr(provider, "_keyring_id", None)
+            ):
+                setting.set_value(provider.get_api_key() or setting.default_value)
+            else:
+                setting.set_value(
+                    self.app.config["providers"][provider.provider_name].get(
+                        setting.name, setting.default_value
+                    )
                 )
-            )
             setting.render_to_layout(self.current_provider_layout)
+
+            # Revocation path: clicking this button removes the stored key from
+            # both the credential store and any config.json fallback.
+            if (
+                setting.name == "api_key"
+                and getattr(provider, "_keyring_id", None)
+            ):
+                clear_btn = QPushButton("Clear stored API key")
+                # Readable contrast: dark background with white text in
+                # both themes (the previous "light grey bg + white text"
+                # pairing was unreadable in both light and dark).
+                clear_btn.setStyleSheet(f"""
+                    QPushButton {{
+                        background-color: {"#b3261e" if colorMode == "dark" else "#c62828"};
+                        color: white;
+                        padding: 4px 8px;
+                        font-size: 14px;
+                        border: none;
+                        border-radius: 3px;
+                    }}
+                    QPushButton:hover {{
+                        background-color: {"#d32f2f" if colorMode == "dark" else "#b71c1c"};
+                    }}
+                """)
+
+                def _confirm_and_clear():
+                    # One-click destructive action; ask first, matching
+                    # the rest of the app's flows.
+                    reply = QtWidgets.QMessageBox.question(
+                        self,
+                        _("Clear API key"),
+                        _(
+                            "Remove the stored API key for %s?\n\n"
+                            "This cannot be undone. You will need to re-enter "
+                            "the key from your provider's website."
+                        )
+                        % provider.provider_name,
+                        QtWidgets.QMessageBox.StandardButton.Yes
+                        | QtWidgets.QMessageBox.StandardButton.No,
+                        QtWidgets.QMessageBox.StandardButton.No,
+                    )
+                    if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                        return
+                    provider.clear_stored_api_key()
+
+                clear_btn.clicked.connect(_confirm_and_clear)
+                self.current_provider_layout.addWidget(clear_btn)
 
         layout.addLayout(self.current_provider_layout)
 

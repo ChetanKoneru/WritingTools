@@ -1,0 +1,33 @@
+# Agent/shell transcripts (large, contain session history)
+.agent-shell/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+venv/Scripts/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Build artifacts
+*.spec
+*.exe
+*.app
+
+# Python version
+.python-version

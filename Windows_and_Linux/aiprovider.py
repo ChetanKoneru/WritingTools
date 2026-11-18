@@ -52,14 +52,88 @@ from PySide6 import QtWidgets
 from PySide6.QtWidgets import QVBoxLayout
 from ui.UIUtils import colorMode
 
-# Obfuscation prefix to identify encrypted API keys
-_OBFUSCATION_PREFIX = "enc:"
-_XOR_KEY = 0x5A  # Simple XOR key for obfuscation
+# --- Credential store helpers (keyring / Secret Service) -------------------
+# API keys are persisted in the OS credential store (KDE KWallet / GNOME
+# Keyring / Windows Credential Manager / macOS Keychain) instead of config.json.
+# `keyring` is imported lazily inside each helper so app startup doesn't pay
+# its ~38 ms import cost for users who never configure a provider.
+
+_KEYRING_SERVICE = "WritingTools"
+
+# Single source of truth mapping provider display names to keyring account IDs.
+# Used by both the provider __init__ methods and the app-level v10 migration
+# (which runs before provider instances are created). The shortcut constants
+# below are derived from this dict so the literals exist in exactly one place.
+PROVIDER_KEYRING_IDS = {
+    "Gemini (Recommended)": "gemini",
+    "OpenAI Compatible (For Experts)": "openai_compatible",
+}
+
+GEMINI_KEYRING_ID = PROVIDER_KEYRING_IDS["Gemini (Recommended)"]
+OPENAI_COMPATIBLE_KEYRING_ID = PROVIDER_KEYRING_IDS[
+    "OpenAI Compatible (For Experts)"
+]
+
+
+def _store_api_key(provider_id: str, api_key: str) -> bool:
+    """Persist an API key in the system credential store. Returns True on success."""
+    if not api_key:
+        return _delete_api_key(provider_id)
+    try:
+        import keyring
+
+        keyring.set_password(_KEYRING_SERVICE, provider_id, api_key)
+        return True
+    except Exception as e:
+        logging.warning(f"Could not store API key in credential store: {e}")
+        return False
+
+
+def _retrieve_api_key(provider_id: str) -> str | None:
+    """Retrieve an API key from the system credential store, or None."""
+    try:
+        import keyring
+
+        return keyring.get_password(_KEYRING_SERVICE, provider_id)
+    except Exception:
+        return None
+
+
+def _delete_api_key(provider_id: str) -> bool:
+    """Remove an API key from the system credential store. Returns True on success."""
+    try:
+        import keyring
+
+        keyring.delete_password(_KEYRING_SERVICE, provider_id)
+        return True
+    except Exception as e:
+        # A "not found" error means there was nothing to delete — success.
+        if type(e).__name__ == "PasswordDeleteError":
+            return True
+        return False
+
+
+# Revocation: the credential-store entry can be deleted directly via
+# `_delete_api_key(provider_id)`; no public API persists keys back out
+# of config.json. Use `AIProvider.clear_stored_api_key()` so the key is
+# removed from both the credential store and any config.json fallback.
+def decode_legacy_api_key(raw_key: str) -> str | None:
+    """
+    Decode a legacy `enc:`-prefixed XOR+base64 API key (v8/v9 format).
+    Returns the plaintext key, or None if decoding fails.
+    """
+    if not raw_key or not raw_key.startswith("enc:"):
+        return raw_key
+    try:
+        return bytes(
+            [b ^ 0x5A for b in base64.b64decode(raw_key[4:])]
+        ).decode("utf-8")
+    except Exception:
+        return None
 
 
 @functools.lru_cache(maxsize=1)
 def _cached_gemini_safety_settings():
-    """Module-level cached safety settings for Gemini Provider."""
     from google.genai import types as genai_types
     return [
         genai_types.SafetySetting(
@@ -75,30 +149,6 @@ def _cached_gemini_safety_settings():
             category="HARM_CATEGORY_DANGEROUS_CONTENT", threshold="BLOCK_NONE"
         ),
     ]
-
-
-def obfuscate_api_key(key: str) -> str:
-    """
-    Obfuscate an API key using XOR + Base64 encoding.
-    Returns the obfuscated string with 'enc:' prefix.
-    """
-    if not key or key.startswith(_OBFUSCATION_PREFIX):
-        return key  # Already obfuscated or empty
-    xored = bytes([b ^ _XOR_KEY for b in key.encode("utf-8")])
-    return _OBFUSCATION_PREFIX + base64.b64encode(xored).decode("ascii")
-
-
-def deobfuscate_api_key(obfuscated: str) -> str:
-    """
-    Deobfuscate an API key that was obfuscated with obfuscate_api_key().
-    If the key doesn't have the 'enc:' prefix, returns it as-is (plaintext).
-    """
-    if not obfuscated or not obfuscated.startswith(_OBFUSCATION_PREFIX):
-        return obfuscated  # Not obfuscated, return as-is
-    encoded = obfuscated[len(_OBFUSCATION_PREFIX) :]
-    xored = base64.b64decode(encoded)
-    return bytes([b ^ _XOR_KEY for b in xored]).decode("utf-8")
-
 
 class AIProviderSetting(ABC):
     """
@@ -318,6 +368,7 @@ class AIProvider(ABC):
         logo: str = "generic",
         button_text: str = "Go to URL",
         button_action: callable = None,
+        keyring_id: str | None = None,
     ):
         self.provider_name = provider_name
         self.settings = settings
@@ -326,6 +377,9 @@ class AIProvider(ABC):
         self.logo = logo
         self.button_text = button_text
         self.button_action = button_action
+        # Keyring identifier for this provider (e.g., "gemini", "openai_compatible").
+        # If None, no API key is stored in the credential store.
+        self._keyring_id = keyring_id
 
     @abstractmethod
     def get_response(self, system_instruction: str, prompt: str) -> str:
@@ -337,27 +391,88 @@ class AIProvider(ABC):
     def load_config(self, config: dict):
         """
         Load configuration settings into the provider.
+        This method is read-only regarding the config dict; api_key is
+        expected to already reside in the system credential store (migrated
+        in v10). No secrets are written to config.json here.
         """
         # Release any client built from the previous configuration before
         # rebuilding, so switching providers/settings in Settings doesn't leak
         # the old connection pool. `after_load()` (below) rebuilds the client
         # lazily on the next request, so this must run first.
         self.before_load()
+
+        # api_key lives in the credential store (migrated in v10); read it
+        # there instead of from the config dict. When the store is
+        # unavailable or empty, fall back to the config dict (which may
+        # hold a legacy plaintext or `enc:`-prefixed key) so the app
+        # remains functional on keyring-less systems (headless, minimal
+        # containers). `save_config` independently handles preserving the
+        # key in config.json when the keyring store is unavailable.
+        stored_key = None
+        legacy_key = None
+        if self._keyring_id:
+            stored_key = _retrieve_api_key(self._keyring_id)
+        if not stored_key:
+            legacy = config.get("api_key")
+            legacy_key = decode_legacy_api_key(legacy) if legacy else None
+            if legacy_key:
+                logging.warning(
+                    "Credential store unavailable or empty for %s; "
+                    "falling back to api_key in config.json (%s). "
+                    "Re-save Settings once the keyring is reachable.",
+                    self.provider_name,
+                    getattr(self.app, "config_path", "<unknown>"),
+                )
+
         for setting in self.settings:
-            if setting.name in config:
+            if setting.name == "api_key" and self._keyring_id:
+                key = stored_key or legacy_key or ""
+                setattr(self, setting.name, key)
+                setting.set_value(key)
+            elif setting.name in config:
                 setattr(self, setting.name, config[setting.name])
                 setting.set_value(config[setting.name])
             else:
                 setattr(self, setting.name, setting.default_value)
+                setting.set_value(setting.default_value)
         self.after_load()
 
     def save_config(self):
         """
-        Save provider configuration settings into the main config file.
+        Save provider configuration settings. API keys go to the credential
+        store only; the rest are written to the main config file.
+
+        Behaviour for `api_key`:
+          * Non-empty value + keyring store succeeds → key stored in the
+            credential store only (erased from config.json).
+          * Non-empty value + keyring store fails → key is kept/written to
+            config.json so the app stays functional on keyring-less systems.
+          * Empty value → if an `api_key` still exists in config.json from a
+            prior fallback, preserve it; never silently destroy the user's key.
         """
         config = {}
         for setting in self.settings:
-            config[setting.name] = setting.get_value()
+            value = setting.get_value()
+            if setting.name == "api_key" and self._keyring_id:
+                if value:
+                    if _store_api_key(self._keyring_id, value):
+                        # Stored in keyring — erase from config.json.
+                        pass
+                    else:
+                        # Store failed — keep the key in config.json.
+                        config["api_key"] = value
+                else:
+                    # Empty field — keep any existing config.json key alive
+                    # so a keyring-less system never loses its key.
+                    existing_key = (
+                        self.app.config.get("providers", {})
+                        .get(self.provider_name, {})
+                        .get("api_key")
+                    )
+                    if existing_key:
+                        config["api_key"] = existing_key
+                continue
+            config[setting.name] = value
         self.app.config["providers"][self.provider_name] = config
         self.app.save_config(self.app.config)
 
@@ -381,6 +496,48 @@ class AIProvider(ABC):
         Cancel any ongoing API request.
         """
         pass
+
+    def get_api_key(self) -> str | None:
+        """
+        Return the stored API key from the credential store, falling back
+        to the in-memory attribute if no credential store is configured or
+        available.
+        Subclasses that don't use a credential store should return None.
+        """
+        if self._keyring_id:
+            key = _retrieve_api_key(self._keyring_id)
+            if key is not None:
+                return key
+        return getattr(self, "api_key", None)
+
+    def clear_stored_api_key(self):
+        """
+        Remove the stored API key from the credential store and config fallback.
+        This is the only supported path for revoking a key.
+
+        Also blanks the rendered `api_key` widget so a subsequent Save in
+        SettingsWindow doesn't re-enter the key from the stale field text,
+        and invalidates the cached client so this session can't reuse it.
+        """
+        if self._keyring_id:
+            _delete_api_key(self._keyring_id)
+        providers_cfg = self.app.config.get("providers", {})
+        entry = providers_cfg.get(self.provider_name, {})
+        if "api_key" in entry:
+            entry.pop("api_key", None)
+            self.app.save_config(self.app.config)
+        # Blank every rendered widget too, not just the in-memory attribute,
+        # so a Save in SettingsWindow doesn't re-enter the key from the
+        # stale field text.
+        for setting in self.settings:
+            if setting.name == "api_key":
+                setting.set_value("")
+                widget = getattr(setting, "input", None)
+                if widget is not None:
+                    widget.clear()
+        self.api_key = ""
+        # Invalidate any cached client so this session can't reuse it.
+        self.before_load()
 
 
 class GeminiProvider(AIProvider):
@@ -416,17 +573,10 @@ class GeminiProvider(AIProvider):
                 default_value="gemini-flash-latest",
                 description="Select Gemini model to use",
                 options=[
-                    # `gemini-flash-latest` is a Google-managed alias that currently
-                    # points to Gemini 3 Flash Preview — fast (~1–2s) and high
-                    # quality. Capped at 20 free requests/day per the model's free
-                    # tier.
                     (
                         "⭐ Gemini Flash Latest (very fast | only 20 free uses/day)",
                         "gemini-flash-latest",
                     ),
-                    # Gemma 4 models are unlimited on the free tier but noticeably
-                    # slower (8–15s typical) since they run on different
-                    # infrastructure.
                     ("Gemma 4 31B (slow | unlimited free use)", "gemma-4-31b-it"),
                     (
                         "Gemma 4 26B A4B (slow | unlimited free use)",
@@ -447,6 +597,7 @@ class GeminiProvider(AIProvider):
             "gemini",
             "Get API Key",
             lambda: webbrowser.open("https://aistudio.google.com/app/apikey"),
+            keyring_id=GEMINI_KEYRING_ID,
         )
 
     def _build_config(
@@ -555,30 +706,6 @@ class GeminiProvider(AIProvider):
         finally:
             self.close_requested = False
 
-    def load_config(self, config: dict):
-        """
-        Load configuration, deobfuscating the API key if needed.
-        """
-        # Deobfuscate API key before loading
-        if "api_key" in config:
-            config = config.copy()  # Don't modify the original
-            config["api_key"] = deobfuscate_api_key(config["api_key"])
-        super().load_config(config)
-
-    def save_config(self):
-        """
-        Save configuration, obfuscating the API key for storage.
-        """
-        config = {}
-        for setting in self.settings:
-            value = setting.get_value()
-            # Obfuscate API key before saving
-            if setting.name == "api_key":
-                value = obfuscate_api_key(value)
-            config[setting.name] = value
-        self.app.config["providers"][self.provider_name] = config
-        self.app.save_config(self.app.config)
-
     def after_load(self):
         """
         Defer client construction until the first request (see `_ensure_client`).
@@ -661,6 +788,7 @@ class OpenAICompatibleProvider(AIProvider):
             "openai",
             "Get OpenAI API Key",
             lambda: webbrowser.open("https://platform.openai.com/account/api-keys"),
+            keyring_id=OPENAI_COMPATIBLE_KEYRING_ID,
         )
 
     def get_response(
