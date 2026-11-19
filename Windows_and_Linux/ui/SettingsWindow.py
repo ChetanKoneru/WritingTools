@@ -4,8 +4,6 @@ import sys
 
 from aiprovider import (
     AIProvider,
-    CredentialStoreError,
-    CredentialStoreUncertainError,
 )
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QImage
@@ -155,8 +153,7 @@ class SettingsWindow(QtWidgets.QWidget):
                     button, alignment=QtCore.Qt.AlignmentFlag.AlignCenter
                 )
 
-        # Rendering Settings must not mutate the active configuration.  The
-        # edited provider entry is staged only when Save succeeds.
+        # Rendering Settings must not mutate the active configuration.
         provider_config = self.app.config.get("providers", {}).get(
             provider.provider_name, {}
         )
@@ -167,7 +164,7 @@ class SettingsWindow(QtWidgets.QWidget):
             # populate the field from the provider's stored key instead.
             if (
                 setting.name == "api_key"
-                and getattr(provider, "_keyring_id", None)
+                and provider._keyring_id
             ):
                 setting.set_value(provider.get_api_key() or setting.default_value)
             else:
@@ -178,7 +175,7 @@ class SettingsWindow(QtWidgets.QWidget):
             # both the credential store and any config.json fallback.
             if (
                 setting.name == "api_key"
-                and getattr(provider, "_keyring_id", None)
+                and provider._keyring_id
             ):
                 clear_btn = QPushButton("Clear stored API key")
                 # Readable contrast: dark background with white text in
@@ -216,25 +213,14 @@ class SettingsWindow(QtWidgets.QWidget):
                     )
                     if reply != QtWidgets.QMessageBox.StandardButton.Yes:
                         return
-                    try:
-                        cleared = provider.clear_stored_api_key()
-                    except CredentialStoreUncertainError:
-                        QtWidgets.QMessageBox.warning(
-                            self,
-                            _("API key status uncertain"),
-                            _(
-                                "The API key removal status is uncertain and the key may have "
-                                "changed in the system credential store. Verify it and retry."
-                            ),
-                        )
-                        return
-                    if not cleared:
+                    if not provider.clear_stored_api_key():
                         QtWidgets.QMessageBox.warning(
                             self,
                             _("Clear API key"),
                             _(
                                 "The saved API key could not be fully removed. "
-                                "Check the credential store and config file permissions."
+                                "The key may remain in config.json until settings can be saved. "
+                                "Check the credential store and settings file permissions."
                             ),
                         )
 
@@ -489,9 +475,6 @@ class SettingsWindow(QtWidgets.QWidget):
 
     def save_settings(self):
         """Save the current settings."""
-        # Stage configuration changes. A credential-store failure leaves the
-        # app and config file untouched, although an interrupted vault write
-        # can still have an explicitly reported uncertain outcome.
         config = copy.deepcopy(self.app.config)
         config["locale"] = "en"
 
@@ -508,65 +491,42 @@ class SettingsWindow(QtWidgets.QWidget):
         config["is_config_file_updated_for_v8"] = True
 
         selected_provider = self.app.providers[self.provider_dropdown.currentIndex()]
-        deferred = False
-        try:
-            selected_provider.save_config(config, defer_api_key_failure=True)
-            deferred = getattr(selected_provider, "api_key_deferred", False)
-        except CredentialStoreUncertainError:
-            QtWidgets.QMessageBox.warning(
-                self,
-                _("API key status uncertain"),
-                _(
-                    "Your settings were not saved. The API key may have changed "
-                    "in the system credential store; verify it and retry."
-                ),
-            )
-            return
-        except CredentialStoreError:
-            # Key store failure: handle as deferred so the rest of the save can proceed.
-            deferred = True
+        selected_provider.save_config(config)
 
         try:
             self.app.save_config(config)
         except OSError:
-            rollback = getattr(selected_provider, "rollback_staged_credentials", None)
-            restored = True if rollback is None else rollback()
-            if not restored:
-                QtWidgets.QMessageBox.warning(
-                    self,
-                    _("API key status uncertain"),
-                    _(
-                        "Your settings were not saved and the API key may have changed "
-                        "in the system credential store; verify it and retry."
-                    ),
+            message = _("The settings file could not be saved. Please retry Save.")
+            if selected_provider.api_key_save_outcome == "saved":
+                persisted_provider_config = {
+                    name: value
+                    for name, value in self.app.config.get("providers", {})
+                    .get(selected_provider.provider_name, {})
+                    .items()
+                    if name != "api_key"
+                }
+                selected_provider.load_config(persisted_provider_config)
+                message = _(
+                    "The API key was saved, but the settings file could not be saved. "
+                    "Please retry Save."
                 )
-                return
             QtWidgets.QMessageBox.warning(
                 self,
                 _("Settings not saved"),
-                _(
-                    "The settings file could not be saved. The previous credential "
-                    "state was preserved or restored. Please retry Save."
-                ),
+                message,
             )
             return
 
         self.app.config = config
-        commit = getattr(selected_provider, "commit_staged_credentials", None)
-        if commit is not None:
-            commit()
 
-        if deferred:
-            # The API key could not be saved (credential store unavailable).
-            # Non-secret settings have been persisted; keep the window open so
-            # the user can fix the credential store and retry.
+        if selected_provider.api_key_save_outcome == "failed":
             QtWidgets.QMessageBox.warning(
                 self,
                 _("API key not saved"),
                 _(
-                    "The API key could not be saved because the system credential "
-                    "store is unavailable. Your other settings were saved. Please "
-                    "unlock or enable the credential store, then re-enter the API key."
+                    "The API key could not be confirmed as saved because the system "
+                    "credential store is unavailable. Your other settings were saved. "
+                    "Please unlock or enable the credential store, then retry Save."
                 ),
             )
             return
