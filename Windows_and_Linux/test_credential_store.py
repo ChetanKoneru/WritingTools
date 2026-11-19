@@ -13,6 +13,7 @@ The suite is hermetic: every keyring interaction is mocked, so it behaves
 identically on machines with or without a real SecretService backend.
 """
 
+import copy
 import sys
 import types
 import unittest
@@ -32,6 +33,7 @@ from aiprovider import (
     GEMINI_KEYRING_ID,
     OPENAI_COMPATIBLE_KEYRING_ID,
     CredentialStoreError,
+    CredentialStoreUncertainError,
 )
 
 # One shared QApplication is required before any Qt widget is created.
@@ -442,6 +444,164 @@ class TestTextSettingPasswordMode(unittest.TestCase):
             input_widget.echoMode(),
             QtWidgets.QLineEdit.EchoMode.Password,
         )
+
+
+# --- Restored tests from the pre-`e44e3e3` version of this file. They cover
+# the partial-failure paths the read-back verification and snapshot rollback
+# exist for.  Re-added here rather than rewriting history, since the current
+# `save_config` semantics differ slightly (store failure keeps the key in
+# config.json as a fallback instead of raising).
+class TestCredentialStorePartialFailures(unittest.TestCase):
+    """Restore the deleted rollback/readback coverage."""
+
+    def setUp(self):
+        self.fake = _fake_keyring
+        self.fake._store.clear()
+        self.fake._fail = False
+
+    def tearDown(self):
+        self.fake._fail = False
+
+    def test_failed_write_with_previously_missing_key_is_verified_rollback(self):
+        """A write that fails must not leave a phantom key behind."""
+        with mock.patch.object(
+            self.fake, "set_password", side_effect=RuntimeError("backend interrupted")
+        ):
+            self.assertFalse(_store_api_key("p1", "NEW-KEY", strict=True))
+        self.assertNotIn("p1", self.fake._store)
+
+    def test_store_rejects_a_silent_replacement_failure(self):
+        self.fake._store["p1"] = "OLD-KEY"
+        with mock.patch.object(self.fake, "set_password", return_value=None):
+            self.assertFalse(_store_api_key("p1", "NEW-KEY"))
+        self.assertEqual(self.fake._store["p1"], "OLD-KEY")
+
+    def test_strict_store_reports_uncertain_when_readback_and_rollback_fail(self):
+        self.fake._store["p1"] = "OLD-KEY"
+        set_calls = 0
+
+        def persist_then_fail(service, account, password):
+            nonlocal set_calls
+            set_calls += 1
+            if set_calls == 1:
+                self.fake._store[account] = password
+            raise RuntimeError("backend interrupted")
+
+        with mock.patch.object(self.fake, "set_password", side_effect=persist_then_fail):
+            with self.assertRaises(CredentialStoreUncertainError):
+                _store_api_key("p1", "NEW-KEY", strict=True)
+        self.assertEqual(self.fake._store["p1"], "NEW-KEY")
+
+    def test_strict_store_reports_uncertain_after_post_write_read_failure(self):
+        self.fake._store["p1"] = "OLD-KEY"
+        get_calls = 0
+        set_calls = 0
+
+        def read_then_fail(service, account):
+            nonlocal get_calls
+            get_calls += 1
+            if get_calls == 1:
+                return "OLD-KEY"
+            raise RuntimeError("backend interrupted")
+
+        def write_then_fail_rollback(service, account, password):
+            nonlocal set_calls
+            set_calls += 1
+            if set_calls == 1:
+                self.fake._store[account] = password
+                return
+            raise RuntimeError("no rollback")
+
+        with (
+            mock.patch.object(self.fake, "get_password", side_effect=read_then_fail),
+            mock.patch.object(
+                self.fake, "set_password", side_effect=write_then_fail_rollback
+            ),
+        ):
+            with self.assertRaises(CredentialStoreUncertainError):
+                _store_api_key("p1", "NEW-KEY", strict=True)
+        self.assertEqual(self.fake._store["p1"], "NEW-KEY")
+
+    def test_delete_password_error_with_secret_still_present_is_failure(self):
+        self.fake._store["p1"] = "secret"
+        error = type("PasswordDeleteError", (Exception,), {})
+        with mock.patch.object(self.fake, "delete_password", side_effect=error):
+            self.assertFalse(_delete_api_key("p1"))
+        self.assertEqual(self.fake._store["p1"], "secret")
+
+    def test_delete_rejects_a_silent_noop(self):
+        self.fake._store["p1"] = "secret"
+        with mock.patch.object(self.fake, "delete_password", return_value=None):
+            self.assertFalse(_delete_api_key("p1"))
+        self.assertEqual(self.fake._store["p1"], "secret")
+
+    def test_delete_requires_readback(self):
+        self.fake._store["p1"] = "secret"
+        with mock.patch.object(
+            self.fake, "get_password", side_effect=RuntimeError("unavailable")
+        ):
+            self.assertFalse(_delete_api_key("p1"))
+
+
+class TestProviderSaveConfigPartialFailure(unittest.TestCase):
+    """Restored coverage for save_config's partial-failure paths."""
+
+    def _provider_with_ui_value(self, ui_value, existing_config=None):
+        config = {
+            "providers": {
+                "Gemini (Recommended)": existing_config
+                if existing_config is not None
+                else {}
+            }
+        }
+        app = FakeApp(config)
+        provider = GeminiProvider(app)
+        for setting in provider.settings:
+            if setting.name == "api_key":
+                setting.set_value(ui_value)
+            elif setting.name == "model_name":
+                setting.set_value("gemini-flash-latest")
+            setting.render_to_layout(QtWidgets.QVBoxLayout())
+        return provider, app
+
+    def test_store_failure_aborts_without_writing_plaintext_or_mutating_config(self):
+        provider, app = self._provider_with_ui_value(
+            "NEW-KEY",
+            existing_config={"api_key": "OLD-CONFIG-KEY", "model_name": "old"},
+        )
+        original_config = {
+            "providers": {
+                "Gemini (Recommended)": {
+                    "api_key": "OLD-CONFIG-KEY", "model_name": "old"
+                }
+            }
+        }
+        provider.api_key = "OLD-ACTIVE-KEY"
+        with mock.patch.object(aiprovider, "_store_api_key_with_snapshot", return_value=None):
+            with self.assertRaises(CredentialStoreError):
+                provider.save_config()
+        self.assertEqual(app.config, original_config)
+        self.assertEqual(provider.api_key, "OLD-ACTIVE-KEY")
+        self.assertIsNone(app.saved)
+
+    def test_standalone_save_config_file_failure_restores_vault_and_runtime(self):
+        provider, app = self._provider_with_ui_value(
+            "NEW-KEY", existing_config={"model_name": "old"}
+        )
+        _fake_keyring._store[GEMINI_KEYRING_ID] = "OLD-KEY"
+        provider.api_key = "OLD-KEY"
+        provider.client = object()
+        old_client = provider.client
+        original_config = copy.deepcopy(app.config)
+        with mock.patch.object(app, "save_config", side_effect=OSError("disk unavailable")):
+            with self.assertRaises(OSError):
+                provider.save_config()
+
+        self.assertEqual(_fake_keyring._store[GEMINI_KEYRING_ID], "OLD-KEY")
+        self.assertEqual(app.config, original_config)
+        self.assertEqual(provider.api_key, "OLD-KEY")
+        self.assertIs(provider.client, old_client)
+        self.assertIsNone(provider._staged_credential_snapshot)
 
 
 if __name__ == "__main__":

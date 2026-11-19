@@ -28,17 +28,17 @@ class _Provider:
     provider_name = "New"
     client = object()
 
-    def save_config(self, config):
+    def save_config(self, config, *, defer_api_key_failure=False):
         raise CredentialStoreError()
 
 
 class _UncertainProvider(_Provider):
-    def save_config(self, config):
+    def save_config(self, config, *, defer_api_key_failure=False):
         raise CredentialStoreUncertainError()
 
 
 class _SavedKeyProvider(_Provider):
-    def save_config(self, config):
+    def save_config(self, config, *, defer_api_key_failure=False):
         config.setdefault("providers", {})[self.provider_name] = {"model_name": "x"}
 
 
@@ -70,7 +70,7 @@ class TestSettingsCredentialFailure(unittest.TestCase):
             window.gradient_radio = types.SimpleNamespace(isChecked=lambda: True)
         return window
 
-    def test_failed_key_save_does_not_initialize_or_close(self):
+    def test_failed_key_save_defers_key_but_saves_non_secret_settings(self):
         for providers_only in (True, False):
             with self.subTest(providers_only=providers_only):
                 app = _App()
@@ -80,9 +80,21 @@ class TestSettingsCredentialFailure(unittest.TestCase):
                 with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning:
                     SettingsWindow.save_settings(window)
 
-                self.assertEqual(app.config, {"provider": "Old", "providers": {}})
+                # Deferred key failure: non-secret settings are still persisted,
+                # the key is not written, and the window is kept open.
+                expected = {
+                    "provider": "New",
+                    "is_config_file_updated_for_v8": True,
+                    "locale": "en",
+                    "streaming": False,
+                    "providers": {},
+                }
+                if not providers_only:
+                    expected["shortcut"] = "ctrl+space"
+                    expected["theme"] = "gradient"
+                self.assertEqual(app.config, expected)
                 self.assertIs(app.current_provider, original_provider)
-                app.saved.assert_not_called()
+                app.saved.assert_called_once_with(expected)
                 app.create_tray_icon.assert_not_called()
                 app.register_hotkey.assert_not_called()
                 window.close.assert_not_called()
@@ -262,7 +274,21 @@ class TestRealSettingsCredentialTransactions(unittest.TestCase):
 
                     self.assertTrue(window.isVisible())
                     self.assertEqual(store["gemini"], "OLD-KEY")
-                    self.assertEqual(app.config, {"provider": "Gemini (Recommended)", "providers": {}})
+                    expected_config = {
+                        "provider": "Gemini (Recommended)",
+                        "locale": "en",
+                        "streaming": False,
+                        "is_config_file_updated_for_v8": True,
+                        "providers": {
+                            "Gemini (Recommended)": {
+                                "model_name": "gemini-flash-latest"
+                            }
+                        },
+                    }
+                    if not providers_only:
+                        expected_config["shortcut"] = "ctrl+space"
+                        expected_config["theme"] = "gradient"
+                    self.assertEqual(app.config, expected_config)
                     self.assertIs(app.current_provider, original_provider)
                     self.assertIs(provider.client, original_client)
                     self.assertIsNone(provider._staged_credential_snapshot)

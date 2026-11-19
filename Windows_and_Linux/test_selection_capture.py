@@ -292,7 +292,8 @@ class TestCaptureGuiFinalization(unittest.TestCase):
                 box.defaultButton().click()
 
         QtCore.QTimer.singleShot(0, click_modal)
-        app_module.WritingToolApp._on_capture_finished(harness, holder, "<stale & primary>")
+        with mock.patch.object(QtWidgets.QMessageBox, "warning"):
+            app_module.WritingToolApp._on_capture_finished(harness, holder, "<stale & primary>")
         return harness, observed
 
     def test_primary_accept_requires_modal_answer_and_clears_copy_error(self):

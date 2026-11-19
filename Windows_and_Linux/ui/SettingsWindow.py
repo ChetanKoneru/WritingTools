@@ -508,8 +508,10 @@ class SettingsWindow(QtWidgets.QWidget):
         config["is_config_file_updated_for_v8"] = True
 
         selected_provider = self.app.providers[self.provider_dropdown.currentIndex()]
+        deferred = False
         try:
-            selected_provider.save_config(config)
+            selected_provider.save_config(config, defer_api_key_failure=True)
+            deferred = getattr(selected_provider, "api_key_deferred", False)
         except CredentialStoreUncertainError:
             QtWidgets.QMessageBox.warning(
                 self,
@@ -521,15 +523,8 @@ class SettingsWindow(QtWidgets.QWidget):
             )
             return
         except CredentialStoreError:
-            QtWidgets.QMessageBox.warning(
-                self,
-                _("API key not saved"),
-                _(
-                    "Your settings were not saved because the system credential "
-                    "store is unavailable. Please unlock or enable it and try again."
-                ),
-            )
-            return
+            # Key store failure: handle as deferred so the rest of the save can proceed.
+            deferred = True
 
         try:
             self.app.save_config(config)
@@ -555,14 +550,30 @@ class SettingsWindow(QtWidgets.QWidget):
                 ),
             )
             return
+
         self.app.config = config
         commit = getattr(selected_provider, "commit_staged_credentials", None)
         if commit is not None:
             commit()
 
+        if deferred:
+            # The API key could not be saved (credential store unavailable).
+            # Non-secret settings have been persisted; keep the window open so
+            # the user can fix the credential store and retry.
+            QtWidgets.QMessageBox.warning(
+                self,
+                _("API key not saved"),
+                _(
+                    "The API key could not be saved because the system credential "
+                    "store is unavailable. Your other settings were saved. Please "
+                    "unlock or enable the credential store, then re-enter the API key."
+                ),
+            )
+            return
+
+        # Successful key save: close the onboarding window (or normal Settings)
         if self.providers_only:
             self.app.create_tray_icon()
-
         provider_name = config.get("provider", "Gemini")
         self.app.current_provider = next(
             (
@@ -572,11 +583,9 @@ class SettingsWindow(QtWidgets.QWidget):
             ),
             self.app.providers[0],
         )
-
         self.app.current_provider.load_config(
             config.get("providers", {}).get(provider_name, {})
         )
-
         self.app.register_hotkey()
         self.providers_only = False
         self.close()

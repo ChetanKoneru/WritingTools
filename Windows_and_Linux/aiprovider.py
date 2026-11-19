@@ -554,7 +554,7 @@ class AIProvider(ABC):
                 setting.set_value(setting.default_value)
         self.after_load()
 
-    def save_config(self, app_config: dict | None = None):
+    def save_config(self, app_config: dict | None = None, *, defer_api_key_failure: bool = False):
         """
         Save provider configuration settings. API keys go to the credential
         store only; the rest are written to the main config file.
@@ -562,10 +562,18 @@ class AIProvider(ABC):
         Behaviour for `api_key`:
           * Non-empty value + keyring store succeeds → key stored in the
             credential store only (erased from config.json).
-          * Non-empty value + keyring store fails → abort without modifying
-            config.json or the provider's active configuration.
+          * Non-empty value + keyring store fails → raise CredentialStoreError,
+            unless `defer_api_key_failure` is set, in which case the typed
+            value is kept in the field, any existing config.json fallback key
+            is preserved, and the caller is flagged via `api_key_deferred`.
           * Empty value → if an `api_key` still exists in config.json from a
             prior fallback, preserve it; never silently destroy the user's key.
+
+        `defer_api_key_failure` exists so SettingsWindow can persist non-secret
+        settings (theme, shortcut, provider) while refusing only the API key
+        when the system credential store is unavailable — otherwise a machine
+        without a usable keyring daemon would lock the user out of onboarding
+        entirely.
         """
         # Build a complete replacement entry before mutating application
         # configuration.  In particular, never use config.json as a secret
@@ -573,6 +581,7 @@ class AIProvider(ABC):
         # A prior abandoned staged save must never be rolled back by a later
         # one.  Settings commits or rolls each token explicitly.
         self._staged_credential_snapshot = None
+        self.api_key_deferred = False
         target_config = (
             copy.deepcopy(self.app.config) if app_config is None else app_config
         )
@@ -586,6 +595,21 @@ class AIProvider(ABC):
                         self._keyring_id, value, strict=True
                     )
                     if snapshot is None:
+                        if defer_api_key_failure:
+                            # Keep the typed value in the field (we don't
+                            # touch the widget) and preserve any existing
+                            # config.json fallback key so the app keeps
+                            # working. The caller shows the "API key not
+                            # saved" warning and keeps the window open.
+                            self.api_key_deferred = True
+                            existing_key = (
+                                self.app.config.get("providers", {})
+                                .get(self.provider_name, {})
+                                .get("api_key")
+                            )
+                            if existing_key:
+                                config["api_key"] = existing_key
+                            continue
                         raise CredentialStoreError()
                     self._staged_credential_snapshot = snapshot
                     # Stored in keyring — erase from config.json.

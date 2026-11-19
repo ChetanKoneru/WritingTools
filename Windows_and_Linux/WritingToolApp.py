@@ -774,6 +774,15 @@ class WritingToolApp(QtWidgets.QApplication):
         self._source_window_id = holder.source_window_id
         holder.ready.set()
         if selection_declined:
+            # Give the user visible feedback that their decline was received
+            # and nothing was dispatched. Without this the decline is a
+            # silent no-op and the user has no way to tell that the dialog
+            # was dismissed rather than the capture failing.
+            QMessageBox.warning(
+                self.activeWindow(),
+                "No text selected",
+                "No text was selected. Select text and try again.",
+            )
             return
         if holder.direct_option is not None:
             self.process_option(holder.direct_option)
