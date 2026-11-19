@@ -141,14 +141,24 @@ def _restore_credential_snapshot(provider_id: str, snapshot: _CredentialSnapshot
         return False
 
 
-def _store_api_key_with_snapshot(provider_id: str, api_key: str, *, strict: bool = False) -> _CredentialSnapshot | None:
+def _store_api_key_with_snapshot(
+    provider_id: str,
+    api_key: str,
+    *,
+    strict: bool = False,
+    allow_read_failure: bool = False,
+) -> _CredentialSnapshot | None:
     """Store a key and return the verified pre-write state for later rollback."""
     if not api_key:
         raise ValueError("_store_api_key_with_snapshot requires a non-empty key")
     try:
         snapshot = _read_credential_snapshot(provider_id)
     except CredentialStoreError:
-        if strict:
+        # A locked or missing wallet fails on read before any write is
+        # attempted.  When the caller is deferring key failures, treat that
+        # as "key not saved" instead of aborting the whole save, so the
+        # non-secret settings still reach the config file.
+        if strict and not allow_read_failure:
             raise
         return None
     write_attempted = False
@@ -591,8 +601,15 @@ class AIProvider(ABC):
             value = setting.get_value()
             if setting.name == "api_key" and self._keyring_id:
                 if value:
+                    # When deferring, tolerate a snapshot-read failure the
+                    # same as a write failure: the store is unreachable, so
+                    # there is nothing to stage or roll back, and the rest of
+                    # the save must still proceed.
                     snapshot = _store_api_key_with_snapshot(
-                        self._keyring_id, value, strict=True
+                        self._keyring_id,
+                        value,
+                        strict=True,
+                        allow_read_failure=defer_api_key_failure,
                     )
                     if snapshot is None:
                         if defer_api_key_failure:

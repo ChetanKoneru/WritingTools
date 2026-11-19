@@ -780,8 +780,8 @@ class WritingToolApp(QtWidgets.QApplication):
             # was dismissed rather than the capture failing.
             QMessageBox.warning(
                 self.activeWindow(),
-                "No text selected",
-                "No text was selected. Select text and try again.",
+                _("No text selected"),
+                _("No text was selected. Select text and try again."),
             )
             return
         if holder.direct_option is not None:

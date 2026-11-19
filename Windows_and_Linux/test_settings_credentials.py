@@ -299,6 +299,109 @@ class TestRealSettingsCredentialTransactions(unittest.TestCase):
                     window.close()
                     window.deleteLater()
 
+    # NEW TEST: Case A - read fails (locked wallet), defer is enabled.
+    # The provider entry must still be written with the existing config key.
+    def test_real_clicked_finish_defers_key_when_vault_read_fails(self):
+        for providers_only in (True, False):
+            with self.subTest(providers_only=providers_only):
+                store = {"gemini": "OLD-KEY"}
+                keyring = self._keyring(store)
+                keyring.get_password = mock.Mock(side_effect=RuntimeError("backend down"))
+                with mock.patch.dict(sys.modules, {"keyring": keyring}):
+                    app = _App()
+                    app.config = {"provider": "Gemini (Recommended)", "providers": {}}
+                    window, provider, setting, button = self._real_window_mode(app, providers_only)
+                    provider.client = object()
+                    original_client, original_provider = provider.client, app.current_provider
+                    setting.input.setText("NEW-KEY")
+                    window.show()
+                    with (
+                        mock.patch.object(SettingsWindow, "close") as close,
+                        mock.patch.object(QtWidgets.QMessageBox, "warning") as warning,
+                    ):
+                        button.click()
+
+                    self.assertTrue(window.isVisible())
+                    # Vault was never written to
+                    self.assertEqual(store["gemini"], "OLD-KEY")
+                    expected_config = {
+                        "provider": "Gemini (Recommended)",
+                        "locale": "en",
+                        "streaming": False,
+                        "is_config_file_updated_for_v8": True,
+                        "providers": {
+                            "Gemini (Recommended)": {
+                                "model_name": "gemini-flash-latest"
+                            }
+                        },
+                    }
+                    if not providers_only:
+                        expected_config["shortcut"] = "ctrl+space"
+                        expected_config["theme"] = "gradient"
+                    self.assertEqual(app.config, expected_config)
+                    self.assertIs(app.current_provider, original_provider)
+                    self.assertIs(provider.client, original_client)
+                    self.assertIsNone(provider._staged_credential_snapshot)
+                    app.create_tray_icon.assert_not_called()
+                    app.register_hotkey.assert_not_called()
+                    close.assert_not_called()
+                    self.assertIn("credential store is unavailable", warning.call_args.args[2])
+                    window.close()
+                    window.deleteLater()
+
+    # NEW TEST: Case C - write silently no-ops.
+    def test_real_clicked_finish_defers_key_when_write_silently_noops(self):
+        for providers_only in (True, False):
+            with self.subTest(providers_only=providers_only):
+                store = {"gemini": "OLD-KEY"}
+                keyring = self._keyring(store)
+                # set_password appears to succeed but get_password returns
+                # the old value (silent no-op).
+                def set_then_noops(service, account, value):
+                    pass  # do nothing
+                keyring.set_password = set_then_noops
+                with mock.patch.dict(sys.modules, {"keyring": keyring}):
+                    app = _App()
+                    app.config = {"provider": "Gemini (Recommended)", "providers": {}}
+                    window, provider, setting, button = self._real_window_mode(app, providers_only)
+                    provider.client = object()
+                    original_client, original_provider = provider.client, app.current_provider
+                    setting.input.setText("NEW-KEY")
+                    window.show()
+                    with (
+                        mock.patch.object(SettingsWindow, "close") as close,
+                        mock.patch.object(QtWidgets.QMessageBox, "warning") as warning,
+                    ):
+                        button.click()
+
+                    self.assertTrue(window.isVisible())
+                    # Vault was never written to (silent no-op)
+                    self.assertEqual(store["gemini"], "OLD-KEY")
+                    expected_config = {
+                        "provider": "Gemini (Recommended)",
+                        "locale": "en",
+                        "streaming": False,
+                        "is_config_file_updated_for_v8": True,
+                        "providers": {
+                            "Gemini (Recommended)": {
+                                "model_name": "gemini-flash-latest"
+                            }
+                        },
+                    }
+                    if not providers_only:
+                        expected_config["shortcut"] = "ctrl+space"
+                        expected_config["theme"] = "gradient"
+                    self.assertEqual(app.config, expected_config)
+                    self.assertIs(app.current_provider, original_provider)
+                    self.assertIs(provider.client, original_client)
+                    self.assertIsNone(provider._staged_credential_snapshot)
+                    app.create_tray_icon.assert_not_called()
+                    app.register_hotkey.assert_not_called()
+                    close.assert_not_called()
+                    self.assertIn("credential store is unavailable", warning.call_args.args[2])
+                    window.close()
+                    window.deleteLater()
+
     def test_real_clicked_finish_reports_uncertain_vault_write(self):
         store = {"gemini": "OLD-KEY"}
         keyring = self._keyring(store)
