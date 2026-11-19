@@ -124,7 +124,10 @@ class TestSelectionCapture(unittest.TestCase):
         def sleep(seconds):
             clock[0] += seconds
 
+        calls = []
+
         def copy_without_data(*args, **kwargs):
+            calls.append(args)
             app.injected = True
             return True
 
@@ -141,6 +144,7 @@ class TestSelectionCapture(unittest.TestCase):
             app_module.WritingToolApp._fire_ctrl_c_and_capture_async(app, holder)
             self.assertTrue(holder.ready.wait(1))
         self.assertTrue(app.injected)
+        self.assertEqual(calls, [("c",)])
         self.assertEqual(holder.text, "")
 
     def test_failed_copy_that_leaves_marker_does_not_submit_old_clipboard(self):
@@ -311,10 +315,14 @@ class TestCaptureGuiFinalization(unittest.TestCase):
 
     def test_primary_cancel_does_not_submit_or_dispatch_before_answer(self):
         holder = app_module._SelectedTextHolder()
-        harness, _ = self._finish_with_click(holder, accept=False)
+        holder.show_popup = True
+        with mock.patch.object(QtWidgets.QMessageBox, "warning") as warning:
+            harness, _ = self._finish_with_click(holder, accept=False)
         self.assertEqual(holder.text, "")
         self.assertEqual(holder.error, "No text selected.")
         self.assertEqual(harness.dispatched, [])
+        self.assertEqual(harness.popup_calls, 0)
+        warning.assert_not_called()
         self.assertTrue(holder.ready.is_set())
 
     def test_stale_completion_during_primary_modal_changes_nothing(self):

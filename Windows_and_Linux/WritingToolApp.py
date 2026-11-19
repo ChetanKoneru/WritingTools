@@ -232,32 +232,9 @@ class WritingToolApp(QtWidgets.QApplication):
 
     def _migrate_config(self):
         """
-        One-shot config migration. Catches any user up to the current schema
-        (v9) regardless of where they started — v7, v8, or already current —
-        in a single pass with at most one restart.
-
-        Each version is gated on its own `is_config_file_updated_for_v{N}`
-        flag, so re-running this is a no-op once everything's caught up.
-        Bump CURRENT_CONFIG_VERSION and add a `# v{N}` block when adding a
-        new migration step.
-
-        v8 (introduced 2025):
-          • Google removed Gemini 2.0 from the free API → bump model.
-          • Obfuscate plaintext Gemini API keys (defeats Ctrl+F scanning).
-          The custom-model input field didn't exist pre-v8, so any pre-v8
-          model value is safe to overwrite — there's nothing custom to
-          preserve.
-
-        v9 (introduced 2026):
-          • Google deprecated the Gemma 3 family. Migrate every v8 user on a
-            now-deprecated preset to the new default (`gemini-flash-latest`)
-            so they immediately land on the fast experience. They can opt
-            into the unlimited-but-slow Gemma 4 options from the dropdown
-            if they hit the 20/day Flash quota.
-            Preserve custom model values (which DID exist by then) so a user
-            who picked, say, `gemini-3.1-pro-preview` doesn't get reset.
-          • SDK migration to `google-genai` is code-side only; nothing to
-            do in config.
+        Update model defaults and migrate legacy provider keys to the vault.
+        Per-version flags make completed steps idempotent; keys stay in the
+        config and are retried when the vault is unavailable.
         """
         CURRENT_CONFIG_VERSION = 10
         # Default for new installs and migrating users.
@@ -307,28 +284,6 @@ class WritingToolApp(QtWidgets.QApplication):
                         f'[v8] Bumped Gemini model "{old_model}" -> "{NEW_DEFAULT_MODEL}"'
                     )
                     config_changed = True
-
-                # Migrate the API key into the credential store, then strip it
-                # from config.json so it never writes back to disk. Handles
-                # plaintext keys and legacy `enc:`-prefixed keys. Only pop the
-                # key from config.json when storage succeeds.
-                api_key = gemini_config.get("api_key", "")
-                if api_key:
-                    raw_key = _decode(api_key)
-                    if raw_key:
-                        if _store(PROVIDER_KEYRING_IDS["Gemini (Recommended)"], raw_key):
-                            logging.info("[v8] Migrated Gemini API key to credential store")
-                            config_changed = True
-                            gemini_config.pop("api_key", None)
-                        else:
-                            logging.warning(
-                                "Could not store Gemini API key; "
-                                "keeping it in config.json"
-                            )
-                    else:
-                        logging.warning(
-                            "Could not decode Gemini API key; keeping it in config.json"
-                        )
 
             # v9: only runs for users coming from v8. Preserve tier choice via
             # the V8_TO_V9_MAP so an unlimited-tier user doesn't get silently
@@ -477,9 +432,7 @@ class WritingToolApp(QtWidgets.QApplication):
                 try:
                     os.fsync(directory_fd)
                 except OSError:
-                    # The new file is already visible.  Do not report this as
-                    # a failed save, or callers could roll back credentials
-                    # that have in fact been committed to the config file.
+                    # Replacement already committed; do not report a failed save.
                     logging.warning(
                         "Config replacement committed; directory durability is unconfirmed."
                     )
@@ -489,8 +442,7 @@ class WritingToolApp(QtWidgets.QApplication):
                     os.close(directory_fd)
                 except OSError:
                     if replaced:
-                        # As above, closing after replacement must not turn a
-                        # committed config change into an apparent failure.
+                        # Replacement already committed; do not report a failed save.
                         logging.warning(
                             "Config replacement committed; directory durability is unconfirmed."
                         )
@@ -747,7 +699,6 @@ class WritingToolApp(QtWidgets.QApplication):
         """Finalize a worker capture on the GUI thread."""
         if holder is not self.current_text_holder:
             return
-        selection_declined = False
         if primary_text:
             box = QMessageBox(self.activeWindow())
             box.setIcon(QMessageBox.Icon.Question)
@@ -770,19 +721,9 @@ class WritingToolApp(QtWidgets.QApplication):
                 holder.error = ""
             else:
                 holder.error = "No text selected."
-                selection_declined = True
         self._source_window_id = holder.source_window_id
         holder.ready.set()
-        if selection_declined:
-            # Give the user visible feedback that their decline was received
-            # and nothing was dispatched. Without this the decline is a
-            # silent no-op and the user has no way to tell that the dialog
-            # was dismissed rather than the capture failing.
-            QMessageBox.warning(
-                self.activeWindow(),
-                _("No text selected"),
-                _("No text was selected. Select text and try again."),
-            )
+        if primary_text and holder.error:
             return
         if holder.direct_option is not None:
             self.process_option(holder.direct_option)

@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import unittest
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 from unittest import mock
@@ -21,45 +22,61 @@ class TestConfigPersistence(unittest.TestCase):
     def _temporary_files(self, directory):
         return list(Path(directory).glob(".config.json.*.tmp"))
 
-    def test_serialization_failure_preserves_existing_config_and_cleans_temp(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            original = '{"keep": "existing config"}\n'
-            config_path.write_text(original, encoding="utf-8")
-            previous_config = {"in_memory": "previous"}
-            app = SimpleNamespace(config_path=str(config_path), config=previous_config)
+    def test_precommit_failures_preserve_existing_config_and_clean_temp(self):
+        failures = ["serialization", "replace", "file fsync"]
+        if sys.platform != "win32":
+            failures.append("directory open")
 
-            with self.assertRaises(TypeError):
-                self._save_config(app, {"not_serializable": object()})
+        for name in failures:
+            with self.subTest(failure=name), tempfile.TemporaryDirectory() as directory:
+                config_path = Path(directory) / "config.json"
+                original = '{"keep": "existing config"}\n'
+                config_path.write_text(original, encoding="utf-8")
+                previous_config = {"in_memory": "previous"}
+                app = SimpleNamespace(config_path=str(config_path), config=previous_config)
+                closed_fds = []
 
-            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
-            self.assertIs(app.config, previous_config)
-            self.assertEqual(self._temporary_files(directory), [])
+                with ExitStack() as stack:
+                    if name == "replace":
+                        real_close = app_module.os.close
 
-    def test_replace_failure_preserves_existing_config_and_cleans_temp(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            original = '{"keep": "existing config"}\n'
-            config_path.write_text(original, encoding="utf-8")
-            previous_config = {"in_memory": "previous"}
-            app = SimpleNamespace(config_path=str(config_path), config=previous_config)
-            real_close = app_module.os.close
-            closed_fds = []
+                        def record_close(fd):
+                            closed_fds.append(fd)
+                            return real_close(fd)
 
-            def record_close(fd):
-                closed_fds.append(fd)
-                return real_close(fd)
+                        stack.enter_context(mock.patch.object(
+                            app_module.os, "replace", side_effect=OSError("disk error")
+                        ))
+                        stack.enter_context(mock.patch.object(app_module.os, "close", side_effect=record_close))
+                    elif name == "file fsync":
+                        stack.enter_context(mock.patch.object(
+                            app_module.os, "fsync", side_effect=OSError("sync failed")
+                        ))
+                    elif name == "directory open":
+                        real_open = app_module.os.open
 
-            with mock.patch.object(app_module.os, "replace", side_effect=OSError("disk error")), mock.patch.object(
-                app_module.os, "close", side_effect=record_close
-            ):
-                with self.assertRaises(OSError):
-                    self._save_config(app, {"updated": True})
+                        def fail_directory_open(path, flags, *args):
+                            if os.path.abspath(path) == directory:
+                                raise OSError("open failed")
+                            return real_open(path, flags, *args)
 
-            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
-            self.assertIs(app.config, previous_config)
-            self.assertEqual(self._temporary_files(directory), [])
-            self.assertEqual(len(closed_fds), 0 if sys.platform == "win32" else 1)
+                        stack.enter_context(mock.patch.object(
+                            app_module.os, "open", side_effect=fail_directory_open
+                        ))
+
+                    config = {"not_serializable": object()} if name == "serialization" else {"updated": True}
+                    error = TypeError if name == "serialization" else OSError
+                    with self.assertRaises(error):
+                        self._save_config(app, config)
+
+                self.assertEqual(config_path.read_text(encoding="utf-8"), original)
+                self.assertIs(app.config, previous_config)
+                self.assertEqual(self._temporary_files(directory), [])
+                if name == "replace":
+                    self.assertEqual(len(closed_fds), 0 if sys.platform == "win32" else 1)
+                    for fd in closed_fds:
+                        with self.assertRaises(OSError):
+                            os.fstat(fd)
 
     def test_success_replaces_config_and_updates_app_reference(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -129,30 +146,6 @@ class TestConfigPersistence(unittest.TestCase):
                 ["fsync-file", "open-directory", "replace", "fsync-directory"],
             )
             self.assertEqual(closed_fds, opened_fds)
-
-    @unittest.skipIf(sys.platform == "win32", "Windows does not open config directories")
-    def test_directory_open_failure_preserves_existing_config_and_cleans_temp(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            original = '{"keep": "existing config"}\n'
-            config_path.write_text(original, encoding="utf-8")
-            previous_config = {"in_memory": "previous"}
-            app = SimpleNamespace(config_path=str(config_path), config=previous_config)
-
-            real_open = app_module.os.open
-
-            def fail_directory_open(path, flags, *args):
-                if os.path.abspath(path) == directory:
-                    raise OSError("open failed")
-                return real_open(path, flags, *args)
-
-            with mock.patch.object(app_module.os, "open", side_effect=fail_directory_open):
-                with self.assertRaises(OSError):
-                    self._save_config(app, {"updated": True})
-
-            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
-            self.assertIs(app.config, previous_config)
-            self.assertEqual(self._temporary_files(directory), [])
 
     @unittest.skipIf(sys.platform == "win32", "Windows does not sync config directories")
     def test_directory_fsync_failure_keeps_committed_config_and_logs_sanitized_warning(self):
@@ -232,23 +225,6 @@ class TestConfigPersistence(unittest.TestCase):
                 self._save_config(app, {"saved": True})
 
             self.assertEqual(len(fsync_calls), 1)
-
-    def test_fsync_failure_preserves_disk_and_app_config_and_cleans_temp(self):
-        with tempfile.TemporaryDirectory() as directory:
-            config_path = Path(directory) / "config.json"
-            original = '{"keep": "existing config"}\n'
-            config_path.write_text(original, encoding="utf-8")
-            previous_config = {"in_memory": "previous"}
-            app = SimpleNamespace(config_path=str(config_path), config=previous_config)
-
-            with mock.patch.object(app_module.os, "fsync", side_effect=OSError("sync failed")):
-                with self.assertRaises(OSError):
-                    self._save_config(app, {"updated": True})
-
-            self.assertEqual(config_path.read_text(encoding="utf-8"), original)
-            self.assertIs(app.config, previous_config)
-            self.assertEqual(self._temporary_files(directory), [])
-
 
 if __name__ == "__main__":
     unittest.main()

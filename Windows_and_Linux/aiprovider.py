@@ -38,7 +38,6 @@ import logging
 import threading
 import webbrowser
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from typing import TYPE_CHECKING, List
 
 if TYPE_CHECKING:
@@ -63,31 +62,6 @@ from ui.UIUtils import colorMode
 _KEYRING_SERVICE = "WritingTools"
 
 
-class CredentialStoreError(RuntimeError):
-    """A credential-store operation could not be completed safely."""
-
-    def __init__(self):
-        super().__init__(
-            "The API key could not be saved because the system credential store is unavailable."
-        )
-
-
-class CredentialStoreUncertainError(CredentialStoreError):
-    """The credential store may have accepted a key, but its final state is unknown."""
-
-    def __init__(self):
-        RuntimeError.__init__(
-            self,
-            "The API key may have changed in the system credential store; verify it and retry.",
-        )
-
-
-@dataclass(frozen=True)
-class _CredentialSnapshot:
-    """A credential value read successfully from the vault (None means absent)."""
-
-    value: str | None
-
 # Single source of truth mapping provider display names to keyring account IDs.
 # Used by both the provider __init__ methods and the app-level v10 migration
 # (which runs before provider instances are created). The shortcut constants
@@ -108,82 +82,20 @@ def _credential_failure(operation: str, error: Exception) -> None:
     logging.warning("credential-store operation=%s exception=%s", operation, type(error).__name__)
 
 
-def _read_credential_snapshot(provider_id: str) -> _CredentialSnapshot:
-    try:
-        import keyring
-
-        return _CredentialSnapshot(keyring.get_password(_KEYRING_SERVICE, provider_id))
-    except Exception as error:
-        _credential_failure("read-snapshot", error)
-        raise CredentialStoreError() from error
-
-
-def _restore_credential_snapshot(provider_id: str, snapshot: _CredentialSnapshot) -> bool:
-    """Restore a prior vault state and prove it, including a confirmed absence."""
-    try:
-        import keyring
-    except Exception as error:
-        _credential_failure("restore-import", error)
-        return False
-    try:
-        if snapshot.value is None:
-            keyring.delete_password(_KEYRING_SERVICE, provider_id)
-        else:
-            keyring.set_password(_KEYRING_SERVICE, provider_id, snapshot.value)
-    except Exception as error:
-        # A backend may have completed the operation before raising.  Read it
-        # back below regardless; PasswordDeleteError alone proves nothing.
-        _credential_failure("restore-write", error)
-    try:
-        return keyring.get_password(_KEYRING_SERVICE, provider_id) == snapshot.value
-    except Exception as error:
-        _credential_failure("restore-verify", error)
-        return False
-
-
-def _store_api_key_with_snapshot(
-    provider_id: str,
-    api_key: str,
-    *,
-    strict: bool = False,
-    allow_read_failure: bool = False,
-) -> _CredentialSnapshot | None:
-    """Store a key and return the verified pre-write state for later rollback."""
-    if not api_key:
-        raise ValueError("_store_api_key_with_snapshot requires a non-empty key")
-    try:
-        snapshot = _read_credential_snapshot(provider_id)
-    except CredentialStoreError:
-        # A locked or missing wallet fails on read before any write is
-        # attempted.  When the caller is deferring key failures, treat that
-        # as "key not saved" instead of aborting the whole save, so the
-        # non-secret settings still reach the config file.
-        if strict and not allow_read_failure:
-            raise
-        return None
-    write_attempted = False
-    try:
-        import keyring
-
-        write_attempted = True
-        keyring.set_password(_KEYRING_SERVICE, provider_id, api_key)
-        if keyring.get_password(_KEYRING_SERVICE, provider_id) == api_key:
-            return snapshot
-    except Exception as error:
-        _credential_failure("store-or-verify", error)
-
-    # Do not trust a failed delete/set call: always verify the old state.
-    restored = _restore_credential_snapshot(provider_id, snapshot) if write_attempted else True
-    if strict and not restored:
-        raise CredentialStoreUncertainError()
-    return None
-
-
-def _store_api_key(provider_id: str, api_key: str, *, strict: bool = False) -> bool:
-    """Persist an API key, optionally raising if its final state is unknown."""
+def _store_api_key(provider_id: str, api_key: str) -> bool:
+    """Persist an API key and verify the write with one read-back."""
     if not api_key:
         return _delete_api_key(provider_id)
-    return _store_api_key_with_snapshot(provider_id, api_key, strict=strict) is not None
+    try:
+        import keyring
+
+        keyring.set_password(_KEYRING_SERVICE, provider_id, api_key)
+        if keyring.get_password(_KEYRING_SERVICE, provider_id) == api_key:
+            return True
+        logging.warning("credential-store operation=store-verify exception=VerificationMismatch")
+    except Exception as error:
+        _credential_failure("store-or-verify", error)
+    return False
 
 
 def _retrieve_api_key(provider_id: str) -> str | None:
@@ -501,12 +413,8 @@ class AIProvider(ABC):
         self.logo = logo
         self.button_text = button_text
         self.button_action = button_action
-        # Keyring identifier for this provider (e.g., "gemini", "openai_compatible").
-        # If None, no API key is stored in the credential store.
         self._keyring_id = keyring_id
-        # Set only while Settings has written a new vault credential but has
-        # not yet made the matching config file durable.
-        self._staged_credential_snapshot: _CredentialSnapshot | None = None
+        self.api_key_save_outcome = "not_requested"
 
     @abstractmethod
     def get_response(self, system_instruction: str, prompt: str) -> str:
@@ -564,75 +472,33 @@ class AIProvider(ABC):
                 setting.set_value(setting.default_value)
         self.after_load()
 
-    def save_config(self, app_config: dict | None = None, *, defer_api_key_failure: bool = False):
+    def save_config(self, app_config: dict):
         """
-        Save provider configuration settings. API keys go to the credential
-        store only; the rest are written to the main config file.
-
-        Behaviour for `api_key`:
-          * Non-empty value + keyring store succeeds → key stored in the
-            credential store only (erased from config.json).
-          * Non-empty value + keyring store fails → raise CredentialStoreError,
-            unless `defer_api_key_failure` is set, in which case the typed
-            value is kept in the field, any existing config.json fallback key
-            is preserved, and the caller is flagged via `api_key_deferred`.
-          * Empty value → if an `api_key` still exists in config.json from a
-            prior fallback, preserve it; never silently destroy the user's key.
-
-        `defer_api_key_failure` exists so SettingsWindow can persist non-secret
-        settings (theme, shortcut, provider) while refusing only the API key
-        when the system credential store is unavailable — otherwise a machine
-        without a usable keyring daemon would lock the user out of onboarding
-        entirely.
+        Add this provider's settings to an application configuration copy.
+        A vault failure never prevents non-secret settings from being saved.
+        The caller can inspect `api_key_save_outcome` to show an accurate
+        warning without treating the save as a transaction.
+        A blank API key field keeps the existing credential; use Clear to revoke it.
         """
-        # Build a complete replacement entry before mutating application
-        # configuration.  In particular, never use config.json as a secret
-        # fallback for a newly entered key.
-        # A prior abandoned staged save must never be rolled back by a later
-        # one.  Settings commits or rolls each token explicitly.
-        self._staged_credential_snapshot = None
-        self.api_key_deferred = False
-        target_config = (
-            copy.deepcopy(self.app.config) if app_config is None else app_config
-        )
-        providers = target_config.setdefault("providers", {})
+        providers = app_config.setdefault("providers", {})
         config = {}
+        self.api_key_save_outcome = "not_requested"
         for setting in self.settings:
             value = setting.get_value()
             if setting.name == "api_key" and self._keyring_id:
                 if value:
-                    # When deferring, tolerate a snapshot-read failure the
-                    # same as a write failure: the store is unreachable, so
-                    # there is nothing to stage or roll back, and the rest of
-                    # the save must still proceed.
-                    snapshot = _store_api_key_with_snapshot(
-                        self._keyring_id,
-                        value,
-                        strict=True,
-                        allow_read_failure=defer_api_key_failure,
-                    )
-                    if snapshot is None:
-                        if defer_api_key_failure:
-                            # Keep the typed value in the field (we don't
-                            # touch the widget) and preserve any existing
-                            # config.json fallback key so the app keeps
-                            # working. The caller shows the "API key not
-                            # saved" warning and keeps the window open.
-                            self.api_key_deferred = True
-                            existing_key = (
-                                self.app.config.get("providers", {})
-                                .get(self.provider_name, {})
-                                .get("api_key")
-                            )
-                            if existing_key:
-                                config["api_key"] = existing_key
-                            continue
-                        raise CredentialStoreError()
-                    self._staged_credential_snapshot = snapshot
-                    # Stored in keyring — erase from config.json.
+                    if _store_api_key(self._keyring_id, value):
+                        self.api_key_save_outcome = "saved"
+                    else:
+                        self.api_key_save_outcome = "failed"
+                        existing_key = (
+                            self.app.config.get("providers", {})
+                            .get(self.provider_name, {})
+                            .get("api_key")
+                        )
+                        if existing_key:
+                            config["api_key"] = existing_key
                 else:
-                    # Empty field — keep any existing config.json key alive
-                    # so a keyring-less system never loses its key.
                     existing_key = (
                         self.app.config.get("providers", {})
                         .get(self.provider_name, {})
@@ -643,29 +509,7 @@ class AIProvider(ABC):
                 continue
             config[setting.name] = value
         providers[self.provider_name] = config
-        if app_config is None:
-            try:
-                self.app.save_config(target_config)
-            except OSError:
-                restored = self.rollback_staged_credentials()
-                if not restored:
-                    raise CredentialStoreUncertainError()
-                raise
-            self.app.config = target_config
-            self.commit_staged_credentials()
-        return target_config
-
-    def commit_staged_credentials(self) -> None:
-        """Forget a rollback token after its matching config write succeeds."""
-        self._staged_credential_snapshot = None
-
-    def rollback_staged_credentials(self) -> bool:
-        """Restore the vault state from before the current staged save."""
-        snapshot = self._staged_credential_snapshot
-        self._staged_credential_snapshot = None
-        if snapshot is None or not self._keyring_id:
-            return True
-        return _restore_credential_snapshot(self._keyring_id, snapshot)
+        return app_config
 
     @abstractmethod
     def after_load(self):
@@ -703,38 +547,33 @@ class AIProvider(ABC):
 
     def clear_stored_api_key(self):
         """
-        Remove the stored API key from the credential store and config fallback.
+        Remove the stored API key and its legacy config fallback.
         This is the only supported path for revoking a key.
 
         Also blanks the rendered `api_key` widget so a subsequent Save in
         SettingsWindow doesn't re-enter the key from the stale field text,
         and invalidates the cached client so this session can't reuse it.
 
-        Returns False when the credential store is unavailable; the key is
-        still removed from config.json regardless.
+        Returns False if either location could not be cleared. There is no
+        rollback: a completed vault deletion must not be silently undone.
         """
-        snapshot = None
-        keyring_failure = False
+        vault_deleted = True
         if self._keyring_id:
-            try:
-                snapshot = _read_credential_snapshot(self._keyring_id)
-            except CredentialStoreError:
-                keyring_failure = True
             if not _delete_api_key(self._keyring_id):
-                keyring_failure = True
+                vault_deleted = False
 
         target_config = copy.deepcopy(self.app.config)
         providers_cfg = target_config.get("providers", {})
         entry = providers_cfg.get(self.provider_name, {})
+        config_deleted = True
         if "api_key" in entry:
             entry.pop("api_key", None)
             try:
                 self.app.save_config(target_config)
             except OSError:
-                if snapshot is not None and self._keyring_id:
-                    if not _restore_credential_snapshot(self._keyring_id, snapshot):
-                        raise CredentialStoreUncertainError()
-                return False
+                config_deleted = False
+            # Keep the in-memory legacy fallback cleared after a disk failure,
+            # so a later Save cannot reintroduce a key the user explicitly cleared.
             self.app.config = target_config
 
         # Blank every rendered widget too, not just the in-memory attribute,
@@ -749,7 +588,7 @@ class AIProvider(ABC):
         self.api_key = ""
         # Invalidate any cached client so this session can't reuse it.
         self.before_load()
-        return not keyring_failure
+        return vault_deleted and config_deleted
 
 
 class GeminiProvider(AIProvider):
