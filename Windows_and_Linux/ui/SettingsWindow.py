@@ -1,7 +1,10 @@
+import copy
 import os
 import sys
 
-from aiprovider import AIProvider
+from aiprovider import (
+    AIProvider,
+)
 from PySide6 import QtCore, QtWidgets
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import (
@@ -150,11 +153,10 @@ class SettingsWindow(QtWidgets.QWidget):
                     button, alignment=QtCore.Qt.AlignmentFlag.AlignCenter
                 )
 
-        # Initialize config if needed
-        if "providers" not in self.app.config:
-            self.app.config["providers"] = {}
-        if provider.provider_name not in self.app.config["providers"]:
-            self.app.config["providers"][provider.provider_name] = {}
+        # Rendering Settings must not mutate the active configuration.
+        provider_config = self.app.config.get("providers", {}).get(
+            provider.provider_name, {}
+        )
 
         # Add provider settings
         for setting in provider.settings:
@@ -162,22 +164,18 @@ class SettingsWindow(QtWidgets.QWidget):
             # populate the field from the provider's stored key instead.
             if (
                 setting.name == "api_key"
-                and getattr(provider, "_keyring_id", None)
+                and provider._keyring_id
             ):
                 setting.set_value(provider.get_api_key() or setting.default_value)
             else:
-                setting.set_value(
-                    self.app.config["providers"][provider.provider_name].get(
-                        setting.name, setting.default_value
-                    )
-                )
+                setting.set_value(provider_config.get(setting.name, setting.default_value))
             setting.render_to_layout(self.current_provider_layout)
 
             # Revocation path: clicking this button removes the stored key from
             # both the credential store and any config.json fallback.
             if (
                 setting.name == "api_key"
-                and getattr(provider, "_keyring_id", None)
+                and provider._keyring_id
             ):
                 clear_btn = QPushButton("Clear stored API key")
                 # Readable contrast: dark background with white text in
@@ -215,7 +213,16 @@ class SettingsWindow(QtWidgets.QWidget):
                     )
                     if reply != QtWidgets.QMessageBox.StandardButton.Yes:
                         return
-                    provider.clear_stored_api_key()
+                    if not provider.clear_stored_api_key():
+                        QtWidgets.QMessageBox.warning(
+                            self,
+                            _("Clear API key"),
+                            _(
+                                "The saved API key could not be fully removed. "
+                                "The key may remain in config.json until settings can be saved. "
+                                "Check the credential store and settings file permissions."
+                            ),
+                        )
 
                 clear_btn.clicked.connect(_confirm_and_clear)
                 self.current_provider_layout.addWidget(clear_btn)
@@ -468,25 +475,66 @@ class SettingsWindow(QtWidgets.QWidget):
 
     def save_settings(self):
         """Save the current settings."""
-        self.app.config["locale"] = "en"
+        config = copy.deepcopy(self.app.config)
+        config["locale"] = "en"
 
         if not self.providers_only:
-            self.app.config["shortcut"] = self.shortcut_input.text()
-            self.app.config["theme"] = (
+            config["shortcut"] = self.shortcut_input.text()
+            config["theme"] = (
                 "gradient" if self.gradient_radio.isChecked() else "plain"
             )
-        else:
-            self.app.create_tray_icon()
 
-        self.app.config["streaming"] = False
-        self.app.config["provider"] = self.provider_dropdown.currentText()
+        config["streaming"] = False
+        config["provider"] = self.provider_dropdown.currentText()
 
         # Mark config as updated for v8 (new users start with this flag set)
-        self.app.config["is_config_file_updated_for_v8"] = True
+        config["is_config_file_updated_for_v8"] = True
 
-        self.app.providers[self.provider_dropdown.currentIndex()].save_config()
+        selected_provider = self.app.providers[self.provider_dropdown.currentIndex()]
+        selected_provider.save_config(config)
 
-        provider_name = self.app.config.get("provider", "Gemini")
+        try:
+            self.app.save_config(config)
+        except OSError:
+            message = _("The settings file could not be saved. Please retry Save.")
+            if selected_provider.api_key_save_outcome == "saved":
+                persisted_provider_config = {
+                    name: value
+                    for name, value in self.app.config.get("providers", {})
+                    .get(selected_provider.provider_name, {})
+                    .items()
+                    if name != "api_key"
+                }
+                selected_provider.load_config(persisted_provider_config)
+                message = _(
+                    "The API key was saved, but the settings file could not be saved. "
+                    "Please retry Save."
+                )
+            QtWidgets.QMessageBox.warning(
+                self,
+                _("Settings not saved"),
+                message,
+            )
+            return
+
+        self.app.config = config
+
+        if selected_provider.api_key_save_outcome == "failed":
+            QtWidgets.QMessageBox.warning(
+                self,
+                _("API key not saved"),
+                _(
+                    "The API key could not be confirmed as saved because the system "
+                    "credential store is unavailable. Your other settings were saved. "
+                    "Please unlock or enable the credential store, then retry Save."
+                ),
+            )
+            return
+
+        # Successful key save: close the onboarding window (or normal Settings)
+        if self.providers_only:
+            self.app.create_tray_icon()
+        provider_name = config.get("provider", "Gemini")
         self.app.current_provider = next(
             (
                 provider
@@ -495,11 +543,9 @@ class SettingsWindow(QtWidgets.QWidget):
             ),
             self.app.providers[0],
         )
-
         self.app.current_provider.load_config(
-            self.app.config.get("providers", {}).get(provider_name, {})
+            config.get("providers", {}).get(provider_name, {})
         )
-
         self.app.register_hotkey()
         self.providers_only = False
         self.close()

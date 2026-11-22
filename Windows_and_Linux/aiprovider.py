@@ -32,6 +32,7 @@ Note: Streaming has been fully removed throughout the code.
 """
 
 import base64
+import copy
 import functools
 import logging
 import threading
@@ -49,7 +50,7 @@ if TYPE_CHECKING:
 # runs on a worker thread) keeps that cost off app startup and off the GUI
 # thread when switching providers in Settings.
 from PySide6 import QtWidgets
-from PySide6.QtWidgets import QVBoxLayout
+from PySide6.QtWidgets import QCheckBox, QVBoxLayout
 from ui.UIUtils import colorMode
 
 # --- Credential store helpers (keyring / Secret Service) -------------------
@@ -59,6 +60,7 @@ from ui.UIUtils import colorMode
 # its ~38 ms import cost for users who never configure a provider.
 
 _KEYRING_SERVICE = "WritingTools"
+
 
 # Single source of truth mapping provider display names to keyring account IDs.
 # Used by both the provider __init__ methods and the app-level v10 migration
@@ -75,18 +77,25 @@ OPENAI_COMPATIBLE_KEYRING_ID = PROVIDER_KEYRING_IDS[
 ]
 
 
+def _credential_failure(operation: str, error: Exception) -> None:
+    """Log useful backend diagnostics without exposing a secret or its message."""
+    logging.warning("credential-store operation=%s exception=%s", operation, type(error).__name__)
+
+
 def _store_api_key(provider_id: str, api_key: str) -> bool:
-    """Persist an API key in the system credential store. Returns True on success."""
+    """Persist an API key and verify the write with one read-back."""
     if not api_key:
         return _delete_api_key(provider_id)
     try:
         import keyring
 
         keyring.set_password(_KEYRING_SERVICE, provider_id, api_key)
-        return True
-    except Exception as e:
-        logging.warning(f"Could not store API key in credential store: {e}")
-        return False
+        if keyring.get_password(_KEYRING_SERVICE, provider_id) == api_key:
+            return True
+        logging.warning("credential-store operation=store-verify exception=VerificationMismatch")
+    except Exception as error:
+        _credential_failure("store-or-verify", error)
+    return False
 
 
 def _retrieve_api_key(provider_id: str) -> str | None:
@@ -95,7 +104,8 @@ def _retrieve_api_key(provider_id: str) -> str | None:
         import keyring
 
         return keyring.get_password(_KEYRING_SERVICE, provider_id)
-    except Exception:
+    except Exception as error:
+        _credential_failure("retrieve", error)
         return None
 
 
@@ -105,11 +115,17 @@ def _delete_api_key(provider_id: str) -> bool:
         import keyring
 
         keyring.delete_password(_KEYRING_SERVICE, provider_id)
-        return True
     except Exception as e:
         # A "not found" error means there was nothing to delete — success.
-        if type(e).__name__ == "PasswordDeleteError":
-            return True
+        if type(e).__name__ != "PasswordDeleteError":
+            _credential_failure("delete", e)
+            return False
+    try:
+        # Delete APIs can report success without removing the credential.
+        # Treat an unreadable or still-present entry as a failed revocation.
+        return keyring.get_password(_KEYRING_SERVICE, provider_id) is None
+    except Exception as error:
+        _credential_failure("delete-verify", error)
         return False
 
 
@@ -194,8 +210,10 @@ class TextSetting(AIProviderSetting):
         display_name: str = None,
         default_value: str = None,
         description: str = None,
+        password: bool = False,
     ):
         super().__init__(name, display_name, default_value, description)
+        self.password = password
         self.internal_value = default_value
         self.input = None
 
@@ -207,6 +225,11 @@ class TextSetting(AIProviderSetting):
         )
         row_layout.addWidget(label)
         self.input = QtWidgets.QLineEdit(self.internal_value)
+        if self.password:
+            # Mask the value by default (API keys shouldn't be shown in
+            # plaintext on screen). Users can toggle visibility with the
+            # "Show key" checkbox.
+            self.input.setEchoMode(QtWidgets.QLineEdit.EchoMode.Password)
         self.input.setStyleSheet(f"""
             font-size: 16px;
             padding: 5px;
@@ -216,6 +239,19 @@ class TextSetting(AIProviderSetting):
         """)
         self.input.setPlaceholderText(self.description)
         row_layout.addWidget(self.input)
+        if self.password:
+            show_key = QCheckBox("Show key")
+            show_key.setStyleSheet(
+                f"font-size: 16px; color: {'#ffffff' if colorMode == 'dark' else '#333333'};"
+            )
+            show_key.toggled.connect(
+                lambda checked: self.input.setEchoMode(
+                    QtWidgets.QLineEdit.EchoMode.Normal
+                    if checked
+                    else QtWidgets.QLineEdit.EchoMode.Password
+                )
+            )
+            row_layout.addWidget(show_key)
         layout.addLayout(row_layout)
 
     def set_value(self, value):
@@ -377,9 +413,8 @@ class AIProvider(ABC):
         self.logo = logo
         self.button_text = button_text
         self.button_action = button_action
-        # Keyring identifier for this provider (e.g., "gemini", "openai_compatible").
-        # If None, no API key is stored in the credential store.
         self._keyring_id = keyring_id
+        self.api_key_save_outcome = "not_requested"
 
     @abstractmethod
     def get_response(self, system_instruction: str, prompt: str) -> str:
@@ -437,33 +472,33 @@ class AIProvider(ABC):
                 setting.set_value(setting.default_value)
         self.after_load()
 
-    def save_config(self):
+    def save_config(self, app_config: dict):
         """
-        Save provider configuration settings. API keys go to the credential
-        store only; the rest are written to the main config file.
-
-        Behaviour for `api_key`:
-          * Non-empty value + keyring store succeeds → key stored in the
-            credential store only (erased from config.json).
-          * Non-empty value + keyring store fails → key is kept/written to
-            config.json so the app stays functional on keyring-less systems.
-          * Empty value → if an `api_key` still exists in config.json from a
-            prior fallback, preserve it; never silently destroy the user's key.
+        Add this provider's settings to an application configuration copy.
+        A vault failure never prevents non-secret settings from being saved.
+        The caller can inspect `api_key_save_outcome` to show an accurate
+        warning without treating the save as a transaction.
+        A blank API key field keeps the existing credential; use Clear to revoke it.
         """
+        providers = app_config.setdefault("providers", {})
         config = {}
+        self.api_key_save_outcome = "not_requested"
         for setting in self.settings:
             value = setting.get_value()
             if setting.name == "api_key" and self._keyring_id:
                 if value:
                     if _store_api_key(self._keyring_id, value):
-                        # Stored in keyring — erase from config.json.
-                        pass
+                        self.api_key_save_outcome = "saved"
                     else:
-                        # Store failed — keep the key in config.json.
-                        config["api_key"] = value
+                        self.api_key_save_outcome = "failed"
+                        existing_key = (
+                            self.app.config.get("providers", {})
+                            .get(self.provider_name, {})
+                            .get("api_key")
+                        )
+                        if existing_key:
+                            config["api_key"] = existing_key
                 else:
-                    # Empty field — keep any existing config.json key alive
-                    # so a keyring-less system never loses its key.
                     existing_key = (
                         self.app.config.get("providers", {})
                         .get(self.provider_name, {})
@@ -473,8 +508,8 @@ class AIProvider(ABC):
                         config["api_key"] = existing_key
                 continue
             config[setting.name] = value
-        self.app.config["providers"][self.provider_name] = config
-        self.app.save_config(self.app.config)
+        providers[self.provider_name] = config
+        return app_config
 
     @abstractmethod
     def after_load(self):
@@ -512,20 +547,35 @@ class AIProvider(ABC):
 
     def clear_stored_api_key(self):
         """
-        Remove the stored API key from the credential store and config fallback.
+        Remove the stored API key and its legacy config fallback.
         This is the only supported path for revoking a key.
 
         Also blanks the rendered `api_key` widget so a subsequent Save in
         SettingsWindow doesn't re-enter the key from the stale field text,
         and invalidates the cached client so this session can't reuse it.
+
+        Returns False if either location could not be cleared. There is no
+        rollback: a completed vault deletion must not be silently undone.
         """
+        vault_deleted = True
         if self._keyring_id:
-            _delete_api_key(self._keyring_id)
-        providers_cfg = self.app.config.get("providers", {})
+            if not _delete_api_key(self._keyring_id):
+                vault_deleted = False
+
+        target_config = copy.deepcopy(self.app.config)
+        providers_cfg = target_config.get("providers", {})
         entry = providers_cfg.get(self.provider_name, {})
+        config_deleted = True
         if "api_key" in entry:
             entry.pop("api_key", None)
-            self.app.save_config(self.app.config)
+            try:
+                self.app.save_config(target_config)
+            except OSError:
+                config_deleted = False
+            # Keep the in-memory legacy fallback cleared after a disk failure,
+            # so a later Save cannot reintroduce a key the user explicitly cleared.
+            self.app.config = target_config
+
         # Blank every rendered widget too, not just the in-memory attribute,
         # so a Save in SettingsWindow doesn't re-enter the key from the
         # stale field text.
@@ -538,6 +588,7 @@ class AIProvider(ABC):
         self.api_key = ""
         # Invalidate any cached client so this session can't reuse it.
         self.before_load()
+        return vault_deleted and config_deleted
 
 
 class GeminiProvider(AIProvider):
@@ -566,6 +617,7 @@ class GeminiProvider(AIProvider):
                 name="api_key",
                 display_name="API Key",
                 description="Paste your Gemini API key here",
+                password=True,
             ),
             DropdownSetting(
                 name="model_name",
@@ -761,6 +813,7 @@ class OpenAICompatibleProvider(AIProvider):
                 name="api_key",
                 display_name="API Key",
                 description="API key for the OpenAI-compatible API.",
+                password=True,
             ),
             TextSetting(
                 "api_base",

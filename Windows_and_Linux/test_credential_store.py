@@ -1,362 +1,269 @@
-"""
-Unit tests for API key storage / legacy decoding / provider config migration.
+"""Credential-store and provider configuration regression tests."""
 
-Run with:
-    QT_QPA_PLATFORM=offscreen uv run python -m unittest test_credential_store -v
+from _test_support import fake_keyring
 
-These cover the three cases that matter for the credential-store migration:
-  * plaintext key  -> moved into the credential store
-  * enc: key       -> decoded, then moved into the credential store
-  * store failure  -> key kept in config.json and still usable by the app
-
-The suite is hermetic: every keyring interaction is mocked, so it behaves
-identically on machines with or without a real SecretService backend.
-"""
-
+import copy
+import base64
 import sys
-import types
 import unittest
 from unittest import mock
 
 from PySide6 import QtWidgets
 
-import aiprovider
 from aiprovider import (
     GeminiProvider,
-    decode_legacy_api_key,
-    _store_api_key,
-    _retrieve_api_key,
+    OpenAICompatibleProvider,
     _delete_api_key,
-    PROVIDER_KEYRING_IDS,
-    GEMINI_KEYRING_ID,
-    OPENAI_COMPATIBLE_KEYRING_ID,
+    _retrieve_api_key,
+    _store_api_key,
+    decode_legacy_api_key,
 )
+import WritingToolApp as app_module
 
-# One shared QApplication is required before any Qt widget is created.
+
 _qt_app = QtWidgets.QApplication.instance() or QtWidgets.QApplication([])
 
 
-# --- Global fake keyring ----------------------------------------------------
-# Module-level fake so NO test can reach the developer's real credential
-# store, even if a test forgets to patch an individual helper. Individual
-# tests may set `_fake_keyring._fail = True` to simulate an unavailable
-# backend.
-_fake_keyring = types.ModuleType("keyring")
-_fake_keyring._store = {}
-_fake_keyring._fail = False
-
-
-def _fake_set_password(service, account, password):
-    if _fake_keyring._fail:
-        raise RuntimeError("no backend")
-    _fake_keyring._store[account] = password
-
-
-def _fake_get_password(service, account):
-    if _fake_keyring._fail:
-        raise RuntimeError("no backend")
-    return _fake_keyring._store.get(account)
-
-
-def _fake_delete_password(service, account):
-    if _fake_keyring._fail:
-        raise RuntimeError("no backend")
-    if account not in _fake_keyring._store:
-        err = type("PasswordDeleteError", (Exception,), {})
-        raise err("not found")
-    del _fake_keyring._store[account]
-
-
-_fake_keyring.set_password = _fake_set_password
-_fake_keyring.get_password = _fake_get_password
-_fake_keyring.delete_password = _fake_delete_password
-
-
-def setUpModule():
-    """Install a fake keyring module for the entire test suite."""
-    _fake_keyring._store.clear()
-    _fake_keyring._fail = False
-    sys.modules["keyring"] = _fake_keyring
-
-
-def tearDownModule():
-    sys.modules.pop("keyring", None)
-
-
-
-def make_enc_key(plaintext: str) -> str:
-    """Encode a key the way v8/v9 did (XOR 0x5A + base64) for round-trip tests."""
-    import base64
-
-    xored = bytes([b ^ 0x5A for b in plaintext.encode("utf-8")])
-    return "enc:" + base64.b64encode(xored).decode("ascii")
-
-
 class FakeApp:
-    """Minimal stand-in for WritingToolApp used by provider load/save tests."""
-
-    def __init__(self, config=None):
-        self.config = config if config is not None else {}
-        self.saved = None
+    def __init__(self, config):
+        self.config = copy.deepcopy(config)
+        self.saved = []
 
     def save_config(self, config):
-        self.saved = config
-        self.config = config
+        self.saved.append(copy.deepcopy(config))
 
 
-class TestDecodeLegacyApiKey(unittest.TestCase):
-    def test_plaintext_passthrough(self):
-        self.assertEqual(decode_legacy_api_key("sk-plain-key"), "sk-plain-key")
-
-    def test_empty_passthrough(self):
-        self.assertEqual(decode_legacy_api_key(""), "")
-
-    def test_enc_roundtrip(self):
-        original = "AIzaSyExampleKey123"
-        self.assertEqual(decode_legacy_api_key(make_enc_key(original)), original)
-
-    def test_invalid_enc_returns_none(self):
-        self.assertIsNone(decode_legacy_api_key("enc:not-valid-base64!!!"))
-
-
-class TestCredentialStoreHelpers(unittest.TestCase):
+class KeyringTestCase(unittest.TestCase):
     def setUp(self):
-        # The module-level setUpModule() already installed a fake keyring,
-        # but per-test isolation is still useful for toggling _fail.
-        self.fake = _fake_keyring
-        self.fake._store.clear()
-        self.fake._fail = False
+        self.store = {}
+        self.keyring = fake_keyring(self.store)
+        self.keyring_patch = mock.patch.dict(sys.modules, {"keyring": self.keyring})
+        self.keyring_patch.start()
 
     def tearDown(self):
-        self.fake._fail = False
-
-    def test_store_and_retrieve(self):
-        self.assertTrue(_store_api_key("p1", "secret"))
-        self.assertEqual(_retrieve_api_key("p1"), "secret")
-
-    def test_store_reports_failure(self):
-        self.fake._fail = True
-        self.assertFalse(_store_api_key("p1", "secret"))
-        self.assertIsNone(_retrieve_api_key("p1"))
-
-    def test_delete_missing_is_success(self):
-        # PasswordDeleteError (nothing stored) counts as success.
-        self.assertTrue(_delete_api_key("never-stored"))
-
-    def test_delete_when_unavailable_is_failure(self):
-        self.fake._fail = True
-        self.assertFalse(_delete_api_key("p1"))
+        self.keyring_patch.stop()
 
 
-class TestProviderLoadConfig(unittest.TestCase):
-    def setUp(self):
-        self.app = FakeApp({"providers": {"Gemini (Recommended)": {}}})
-        self.provider = GeminiProvider(self.app)
+class TestCredentialStoreHelpers(KeyringTestCase):
+    def test_legacy_decoding_accepts_plaintext_and_rejects_invalid_encoding(self):
+        self.assertEqual(decode_legacy_api_key("plain-key"), "plain-key")
+        encoded = base64.b64encode(bytes(b ^ 0x5A for b in b"legacy-key")).decode()
+        self.assertEqual(decode_legacy_api_key(f"enc:{encoded}"), "legacy-key")
+        self.assertIsNone(decode_legacy_api_key("enc:not-base64!"))
 
-    def test_key_from_credential_store(self):
-        with mock.patch.object(aiprovider, "_retrieve_api_key", return_value="STORE-KEY"):
-            self.provider.load_config({"model_name": "gemini-flash-latest"})
-            # Assert inside the patch: get_api_key() consults the credential
-            # store, so the mock must still be active for the call.
-            self.assertEqual(self.provider.get_api_key(), "STORE-KEY")
-        self.assertEqual(self.provider.api_key, "STORE-KEY")
+    def test_store_then_readback_succeeds(self):
+        self.keyring.set_password = mock.Mock(wraps=self.keyring.set_password)
+        self.keyring.get_password = mock.Mock(wraps=self.keyring.get_password)
+        self.assertTrue(_store_api_key("provider", "secret"))
+        self.keyring.set_password.assert_called_once_with("WritingTools", "provider", "secret")
+        self.keyring.get_password.assert_called_once_with("WritingTools", "provider")
+        self.assertEqual(_retrieve_api_key("provider"), "secret")
 
-    def test_fallback_to_plaintext_config_key(self):
-        with mock.patch.object(aiprovider, "_retrieve_api_key", return_value=None):
-            self.provider.load_config(
-                {"api_key": "CONFIG-KEY", "model_name": "gemini-flash-latest"}
-            )
-            # The key must still be usable even with no credential store.
-            self.assertEqual(self.provider.get_api_key(), "CONFIG-KEY")
-        self.assertEqual(self.provider.api_key, "CONFIG-KEY")
+    def test_readback_mismatch_is_failure_and_logs_no_secret(self):
+        self.keyring.get_password = lambda service, account: "other"
+        with self.assertLogs("root", "WARNING") as logs:
+            self.assertFalse(_store_api_key("provider", "secret"))
+        self.assertIn("VerificationMismatch", logs.output[0])
+        self.assertNotIn("secret", "\n".join(logs.output))
 
-    def test_fallback_to_enc_config_key(self):
-        with mock.patch.object(aiprovider, "_retrieve_api_key", return_value=None):
-            self.provider.load_config(
-                {
-                    "api_key": make_enc_key("DECODED-KEY"),
-                    "model_name": "gemini-flash-latest",
-                }
-            )
-            self.assertEqual(self.provider.get_api_key(), "DECODED-KEY")
-        self.assertEqual(self.provider.api_key, "DECODED-KEY")
+    def test_backend_failure_is_sanitized(self):
+        self.keyring.set_password = mock.Mock(side_effect=RuntimeError("secret"))
+        with self.assertLogs("root", "WARNING") as logs:
+            self.assertFalse(_store_api_key("provider", "secret"))
+        self.assertIn("RuntimeError", logs.output[0])
+        self.assertNotIn("secret", logs.output[0])
+
+    def test_delete_is_verified(self):
+        self.store["provider"] = "secret"
+        self.assertTrue(_delete_api_key("provider"))
+        self.assertNotIn("provider", self.store)
+
+    def test_missing_delete_is_a_verified_noop(self):
+        self.assertTrue(_delete_api_key("missing"))
+
+    def test_delete_failure_readback_failure_and_silent_noop_are_false(self):
+        for method in ("delete_password", "get_password", "silent_noop"):
+            with self.subTest(method=method):
+                self.store["provider"] = "secret"
+                if method == "silent_noop":
+                    replacement = mock.Mock()
+                    target = "delete_password"
+                else:
+                    replacement = mock.Mock(side_effect=RuntimeError("backend down"))
+                    target = method
+                with mock.patch.object(self.keyring, target, replacement):
+                    self.assertFalse(_delete_api_key("provider"))
 
 
-class TestProviderSaveConfig(unittest.TestCase):
-    def _provider_with_ui_value(self, ui_value, existing_config=None):
-        config = {
-            "providers": {
-                "Gemini (Recommended)": existing_config
-                if existing_config is not None
-                else {}
-            }
-        }
+class TestProviderCredentialSaving(KeyringTestCase):
+    def _provider(self, config):
         app = FakeApp(config)
         provider = GeminiProvider(app)
-        # Simulate the Settings UI: set values, then render widgets so
-        # `get_value()` has real Qt inputs to read from.
+        layout = QtWidgets.QVBoxLayout()
         for setting in provider.settings:
-            if setting.name == "api_key":
-                setting.set_value(ui_value)
-            elif setting.name == "model_name":
-                setting.set_value("gemini-flash-latest")
-            setting.render_to_layout(QtWidgets.QVBoxLayout())
-        return provider, app
+            setting.render_to_layout(layout)
+        return app, provider
 
-    def test_store_success_erases_key_from_config(self):
-        provider, app = self._provider_with_ui_value("NEW-KEY")
-        with mock.patch.object(aiprovider, "_store_api_key", return_value=True):
-            provider.save_config()
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+    @staticmethod
+    def _setting(provider, name):
+        return next(setting for setting in provider.settings if setting.name == name)
 
-    def test_store_failure_keeps_key_in_config(self):
-        provider, app = self._provider_with_ui_value("NEW-KEY")
-        with mock.patch.object(aiprovider, "_store_api_key", return_value=False):
-            provider.save_config()
-        self.assertEqual(
-            app.config["providers"]["Gemini (Recommended)"]["api_key"], "NEW-KEY"
-        )
+    def test_successful_save_migrates_legacy_key_without_config_plaintext(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"providers": {name: {"api_key": "old", "model_name": "old-model"}}})
+        self._setting(provider, "api_key").input.setText("new-secret")
+        model = self._setting(provider, "model_name")
+        model.dropdown.setCurrentIndex(model.dropdown.findData(model._CUSTOM_SENTINEL))
+        model.custom_input.setText("edited-model")
+        config = copy.deepcopy(app.config)
 
-    def test_empty_field_preserves_existing_config_key(self):
-        provider, app = self._provider_with_ui_value(
-            "", existing_config={"api_key": "OLD-CONFIG-KEY"}
-        )
-        with mock.patch.object(aiprovider, "_store_api_key", return_value=False) as m:
-            provider.save_config()
-        # Empty field + keyring down must not destroy the surviving config key.
-        self.assertEqual(
-            app.config["providers"]["Gemini (Recommended)"]["api_key"],
-            "OLD-CONFIG-KEY",
-        )
-        m.assert_not_called()
+        provider.save_config(config)
 
-    def test_empty_field_and_no_config_key_leaves_nothing(self):
-        provider, app = self._provider_with_ui_value("", existing_config={})
-        with mock.patch.object(aiprovider, "_store_api_key", return_value=True) as m:
-            provider.save_config()
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
-        m.assert_not_called()
+        self.assertEqual(provider.api_key_save_outcome, "saved")
+        self.assertEqual(self.store[provider._keyring_id], "new-secret")
+        self.assertNotIn("api_key", config["providers"][name])
+        self.assertEqual(config["providers"][name]["model_name"], "edited-model")
 
+    def test_vault_failure_preserves_legacy_key_and_nonsecret_settings(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"providers": {name: {"api_key": "old-secret", "model_name": "old-model"}}})
+        self._setting(provider, "api_key").input.setText("new-secret")
+        self.keyring.set_password = mock.Mock(side_effect=RuntimeError("backend unavailable"))
+        model = self._setting(provider, "model_name")
+        model.dropdown.setCurrentIndex(model.dropdown.findData(model._CUSTOM_SENTINEL))
+        model.custom_input.setText("edited-model")
+        config = copy.deepcopy(app.config)
 
-class TestClearStoredApiKey(unittest.TestCase):
-    """Revocation: the only supported path for removing a stored key."""
+        provider.save_config(config)
 
-    def _provider_with_config(self, config):
-        app = FakeApp(config)
-        provider = GeminiProvider(app)
-        provider.api_key = "STORE-KEY"
-        return provider, app
+        self.assertEqual(provider.api_key_save_outcome, "failed")
+        self.assertEqual(config["providers"][name]["api_key"], "old-secret")
+        self.assertEqual(config["providers"][name]["model_name"], "edited-model")
+        self.assertNotIn("new-secret", repr(config))
 
-    def _provider_with_rendered_ui(self, ui_value, existing_config=None):
-        """Full render path: widgets are real QLineEdits, Save goes through
-        ``save_config()`` and reads them back with ``get_value()``."""
-        config = {
-            "providers": {
-                "Gemini (Recommended)": existing_config
-                if existing_config is not None
-                else {}
-            }
-        }
-        app = FakeApp(config)
-        provider = GeminiProvider(app)
-        for setting in provider.settings:
-            if setting.name == "api_key":
-                setting.set_value(ui_value)
-            elif setting.name == "model_name":
-                setting.set_value("gemini-flash-latest")
-            setting.render_to_layout(QtWidgets.QVBoxLayout())
-        return provider, app
+    def test_blank_api_key_preserves_legacy_key_without_vault_operations(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"providers": {name: {"api_key": "legacy-secret", "model_name": "old-model"}}})
+        self.keyring.set_password = mock.Mock(wraps=self.keyring.set_password)
+        self.keyring.delete_password = mock.Mock(wraps=self.keyring.delete_password)
+        config = copy.deepcopy(app.config)
 
-    def test_clear_removes_keyring_entry_and_config_fallback(self):
-        config = {
-            "providers": {
-                "Gemini (Recommended)": {
-                    "api_key": "CONFIG-KEY",
-                    "model_name": "gemini-flash-latest",
-                }
-            }
-        }
-        provider, app = self._provider_with_config(config)
-        with mock.patch.object(aiprovider, "_delete_api_key", return_value=True) as m:
-            provider.clear_stored_api_key()
-        m.assert_called_once_with(GEMINI_KEYRING_ID)
-        self.assertEqual(provider.api_key, "")
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
-        # model_name must survive the clear
-        self.assertEqual(
-            app.config["providers"]["Gemini (Recommended)"]["model_name"],
-            "gemini-flash-latest",
-        )
+        provider.save_config(config)
 
-    def test_clear_when_keyring_unavailable_still_removes_config_key(self):
-        config = {
-            "providers": {
-                "Gemini (Recommended)": {
-                    "api_key": "CONFIG-KEY",
-                    "model_name": "gemini-flash-latest",
-                }
-            }
-        }
-        provider, app = self._provider_with_config(config)
-        with mock.patch.object(aiprovider, "_delete_api_key", return_value=False):
-            provider.clear_stored_api_key()
-        self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+        self.keyring.set_password.assert_not_called()
+        self.keyring.delete_password.assert_not_called()
+        self.assertEqual(config["providers"][name]["api_key"], "legacy-secret")
+
+    def test_vault_key_takes_precedence_over_legacy_fallback_on_load(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"api_key": "legacy-secret"})
+        self.store[provider._keyring_id] = "vault-secret"
+
+        provider.load_config(app.config)
+
+        self.assertEqual(provider.api_key, "vault-secret")
+
+    def test_legacy_key_is_used_when_vault_is_empty(self):
+        app, provider = self._provider({"api_key": "legacy-secret"})
+
+        provider.load_config(app.config)
+
+        self.assertEqual(provider.api_key, "legacy-secret")
+
+    def test_gemini_and_openai_api_fields_are_masked(self):
+        app = FakeApp({})
+        for provider in (GeminiProvider(app), OpenAICompatibleProvider(app)):
+            api_setting = self._setting(provider, "api_key")
+            api_setting.render_to_layout(QtWidgets.QVBoxLayout())
+            self.assertEqual(api_setting.input.echoMode(), QtWidgets.QLineEdit.EchoMode.Password)
+
+    def test_clear_removes_legacy_key_and_blanks_widget(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"providers": {name: {"api_key": "old-secret"}}})
+        self.store[provider._keyring_id] = "stored-secret"
+        api_setting = self._setting(provider, "api_key")
+        api_setting.render_to_layout(QtWidgets.QVBoxLayout())
+        api_setting.input.setText("stored-secret")
+        provider.api_key = "stored-secret"
+
+        self.assertTrue(provider.clear_stored_api_key())
+
+        self.assertNotIn(provider._keyring_id, self.store)
+        self.assertNotIn("api_key", app.config["providers"][name])
+        self.assertEqual(api_setting.input.text(), "")
         self.assertEqual(provider.api_key, "")
 
-    def test_clear_without_config_key_is_noop(self):
-        config = {
-            "providers": {"Gemini (Recommended)": {"model_name": "gemini-flash-latest"}}
-        }
-        provider, app = self._provider_with_config(config)
-        with mock.patch.object(aiprovider, "_delete_api_key", return_value=True) as m:
-            provider.clear_stored_api_key()
-        m.assert_called_once_with(GEMINI_KEYRING_ID)
-        self.assertEqual(provider.api_key, "")
-        self.assertEqual(
-            app.config["providers"]["Gemini (Recommended)"]["model_name"],
-            "gemini-flash-latest",
-        )
+    def test_clear_config_failure_does_not_restore_vault_or_stale_input(self):
+        name = "Gemini (Recommended)"
+        app, provider = self._provider({"providers": {name: {"api_key": "old-secret"}}})
+        self.store[provider._keyring_id] = "stored-secret"
+        api_setting = self._setting(provider, "api_key")
+        api_setting.render_to_layout(QtWidgets.QVBoxLayout())
+        api_setting.input.setText("stored-secret")
+        app.save_config = mock.Mock(side_effect=OSError("disk unavailable"))
 
-    def test_clear_then_save_preserves_nothing(self):
-        """Clear → Save regression: after revocation, Save must not restore the key."""
+        self.assertFalse(provider.clear_stored_api_key())
+
+        self.assertNotIn(provider._keyring_id, self.store)
+        self.assertEqual(api_setting.input.text(), "")
+        self.assertNotIn("api_key", app.config["providers"][name])
+
+
+class TestConfigCredentialMigration(unittest.TestCase):
+    @staticmethod
+    def _legacy_encoded(value):
+        return "enc:" + base64.b64encode(bytes(b ^ 0x5A for b in value.encode())).decode()
+
+    def _app(self, config):
+        return type("MigrationApp", (), {"config": config, "save_config": mock.Mock()})()
+
+    def test_plaintext_and_encoded_keys_for_both_known_providers_migrate(self):
         config = {
+            "is_config_file_updated_for_v8": True,
+            "is_config_file_updated_for_v9": True,
             "providers": {
-                "Gemini (Recommended)": {
-                    "api_key": "CONFIG-KEY",
-                    "model_name": "gemini-flash-latest",
-                }
-            }
+                "Gemini (Recommended)": {"api_key": "gemini-secret"},
+                "OpenAI Compatible (For Experts)": {"api_key": self._legacy_encoded("openai-secret")},
+            },
         }
-        # Render the full UI so Save reads the widget text, not the in-memory value
-        provider, app = self._provider_with_rendered_ui("CONFIG-KEY", config)
-        # Patch both helpers so no test can reach the real credential store.
-        # Clear should succeed; Save should also succeed so we can assert
-        # the key isn't re-stored from the stale widget text.
+        app = self._app(config)
+        with mock.patch.object(app_module, "_store", return_value=True) as store:
+            app_module.WritingToolApp._migrate_config(app)
+
+        self.assertEqual(store.call_args_list, [mock.call("gemini", "gemini-secret"), mock.call("openai_compatible", "openai-secret")])
+        self.assertNotIn("api_key", config["providers"]["Gemini (Recommended)"])
+        self.assertNotIn("api_key", config["providers"]["OpenAI Compatible (For Experts)"])
+        self.assertTrue(config["is_config_file_updated_for_v10"])
+
+    def test_failed_migration_keeps_key_and_does_not_stamp_v10(self):
+        config = {"providers": {"Gemini (Recommended)": {"api_key": "secret", "model_name": "gemini-flash-latest"}}}
+        app = self._app(config)
         with (
-            mock.patch.object(aiprovider, "_delete_api_key", return_value=True),
-            mock.patch.object(aiprovider, "_store_api_key", return_value=True),
+            mock.patch.object(app_module, "_store", return_value=False) as store,
+            mock.patch.object(app_module.QMessageBox, "warning"),
         ):
-            provider.clear_stored_api_key()
-            # Verify the store is empty
-            self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
-            # Now Save – this is the regression test
-            provider.save_config()
-            # The store must remain empty; no key should be written back
-            self.assertNotIn("api_key", app.config["providers"]["Gemini (Recommended)"])
+            app_module.WritingToolApp._migrate_config(app)
 
+        store.assert_called_once_with("gemini", "secret")
+        self.assertEqual(config["providers"]["Gemini (Recommended)"]["api_key"], "secret")
+        self.assertNotIn("is_config_file_updated_for_v10", config)
 
-class TestKeyringIdSingleSourceOfTruth(unittest.TestCase):
-    def test_provider_ids_match_map(self):
-        app = FakeApp({"providers": {}})
-        self.assertEqual(
-            GeminiProvider(app)._keyring_id,
-            PROVIDER_KEYRING_IDS["Gemini (Recommended)"],
-        )
-        self.assertEqual(GEMINI_KEYRING_ID, PROVIDER_KEYRING_IDS["Gemini (Recommended)"])
-        self.assertEqual(
-            OPENAI_COMPATIBLE_KEYRING_ID,
-            PROVIDER_KEYRING_IDS["OpenAI Compatible (For Experts)"],
-        )
+    def test_pre_v8_failure_attempts_each_provider_once(self):
+        config = {
+            "providers": {
+                "Gemini (Recommended)": {"api_key": "gemini-secret", "model_name": "gemini-flash-latest"},
+                "OpenAI Compatible (For Experts)": {"api_key": "openai-secret"},
+            }
+        }
+        app = self._app(config)
+        with (
+            mock.patch.object(app_module, "_store", return_value=False) as store,
+            mock.patch.object(app_module.QMessageBox, "warning"),
+        ):
+            app_module.WritingToolApp._migrate_config(app)
+
+        self.assertEqual(store.call_count, 2)
+        self.assertCountEqual(store.call_args_list, [mock.call("gemini", "gemini-secret"), mock.call("openai_compatible", "openai-secret")])
 
 
 if __name__ == "__main__":
